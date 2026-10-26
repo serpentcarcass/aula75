@@ -300,15 +300,23 @@ impl App {
         let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone());
         let mut app = Self::with(jobs, msgs, usb, view);
         app.audio_devices = effects::input_devices();
-        if let Some(s) = cc.storage.and_then(|st| eframe::get_value::<Saved>(st, eframe::APP_KEY)) {
+        if let Some(s) = cc
+            .storage
+            .and_then(|st| eframe::get_value::<Saved>(st, eframe::APP_KEY))
+        {
             app.restore(s);
         }
         app
     }
 
     /// Default state around already-running worker channels.
-    fn with(jobs: mpsc::Sender<Job>, msgs: mpsc::Receiver<Msg>, usb: Arc<Presence>, view: Arc<Mutex<LiveView>>) -> Self {
-        Self {
+    fn with(
+        jobs: mpsc::Sender<Job>,
+        msgs: mpsc::Receiver<Msg>,
+        usb: Arc<Presence>,
+        view: Arc<Mutex<LiveView>>,
+    ) -> Self {
+        let mut app = Self {
             jobs,
             msgs,
             usb,
@@ -317,16 +325,16 @@ impl App {
             status: Ok("Ready"),
             tab: Tab::Lighting,
             light: Light {
-                mode: Mode::all().find(|m| m.name() == "Rolling").unwrap(),
-                rgb: SWATCHES[1],
-                rainbow: true,
-                brightness: Level::new(5),
-                speed: Level::new(3),
-                direction: Direction::Right,
+                mode: Mode::all().next().unwrap(),
+                rgb: [0; 3],
+                rainbow: false,
+                brightness: Level::new(0),
+                speed: Level::new(0),
+                direction: Direction::Left,
             },
-            keys: vec![[0xe6, 0xe8, 0xf0]; KEYS.len()],
-            brush: SWATCHES[5],
-            key_brightness: Level::new(5),
+            keys: vec![],
+            brush: [0; 3],
+            key_brightness: Level::new(0),
             screen_path: String::new(),
             frames: vec![],
             preview: None,
@@ -335,10 +343,12 @@ impl App {
             live_kind: LiveKind::Music,
             audio_devices: vec![],
             audio_device: None,
-            sensitivity: 1.2,
-            work_min: 25,
-            rest_min: 5,
-        }
+            sensitivity: 0.0,
+            work_min: 0,
+            rest_min: 0,
+        };
+        app.restore(Saved::default()); // single source of defaults
+        app
     }
 
     fn saved(&self) -> Saved {
@@ -370,7 +380,7 @@ impl App {
         self.light.rainbow = s.rainbow;
         self.light.brightness = Level::new(s.brightness);
         self.light.speed = Level::new(s.speed);
-        if let Some(d) = [Direction::Left, Direction::Right, Direction::Up, Direction::Down].get(s.direction as usize) {
+        if let Some(d) = Direction::ALL.get(s.direction as usize) {
             self.light.direction = *d;
         }
         if s.keys.len() == KEYS.len() {
@@ -378,13 +388,17 @@ impl App {
         }
         self.brush = s.brush;
         self.key_brightness = Level::new(s.key_brightness);
-        self.live_kind = if s.pomodoro { LiveKind::Pomodoro } else { LiveKind::Music };
+        self.live_kind = if s.pomodoro {
+            LiveKind::Pomodoro
+        } else {
+            LiveKind::Music
+        };
         self.audio_device = s.audio_device;
         if s.sensitivity.is_finite() {
-            self.sensitivity = s.sensitivity.clamp(0.5, 3.0);
+            self.sensitivity = s.sensitivity.clamp(*SENSITIVITY.start(), *SENSITIVITY.end());
         }
-        self.work_min = s.work_min.clamp(5, 90);
-        self.rest_min = s.rest_min.clamp(1, 30);
+        self.work_min = s.work_min.clamp(*FOCUS_MIN.start(), *FOCUS_MIN.end());
+        self.rest_min = s.rest_min.clamp(*BREAK_MIN.start(), *BREAK_MIN.end());
     }
 
     fn run(&mut self, job: Job) {
@@ -669,17 +683,17 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.add_sized([86.0, 20.0], egui::Label::new("Sensitivity"));
-                        ui.add(egui::Slider::new(&mut self.sensitivity, 0.5..=3.0).fixed_decimals(1));
+                        ui.add(egui::Slider::new(&mut self.sensitivity, SENSITIVITY).fixed_decimals(1));
                     });
                 }
                 LiveKind::Pomodoro => {
                     ui.horizontal(|ui| {
                         ui.add_sized([86.0, 20.0], egui::Label::new("Focus"));
-                        ui.add(egui::Slider::new(&mut self.work_min, 5..=90).suffix(" min"));
+                        ui.add(egui::Slider::new(&mut self.work_min, FOCUS_MIN).suffix(" min"));
                     });
                     ui.horizontal(|ui| {
                         ui.add_sized([86.0, 20.0], egui::Label::new("Break"));
-                        ui.add(egui::Slider::new(&mut self.rest_min, 1..=30).suffix(" min"));
+                        ui.add(egui::Slider::new(&mut self.rest_min, BREAK_MIN).suffix(" min"));
                     });
                 }
             });
@@ -1201,8 +1215,14 @@ fn nav(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool) -> bool {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
-/// What survives a restart. Plain values only; `App::restore` re-validates them.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+// Shared by the sliders and `App::restore`, so the two can't drift apart.
+const SENSITIVITY: std::ops::RangeInclusive<f32> = 0.5..=3.0;
+const FOCUS_MIN: std::ops::RangeInclusive<u32> = 5..=90;
+const BREAK_MIN: std::ops::RangeInclusive<u32> = 1..=30;
+
+/// What survives a restart, and the app's defaults. Plain values only; `App::restore`
+/// re-validates them. Fields missing from an older file take these defaults, not zero.
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Saved {
     mode: String,
@@ -1219,6 +1239,27 @@ struct Saved {
     sensitivity: f32,
     work_min: u32,
     rest_min: u32,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Saved {
+            mode: "Rolling".into(),
+            rgb: SWATCHES[1],
+            rainbow: true,
+            brightness: 5,
+            speed: 3,
+            direction: Direction::Right as u8,
+            keys: vec![[0xe6, 0xe8, 0xf0]; KEYS.len()],
+            brush: SWATCHES[5],
+            key_brightness: 5,
+            pomodoro: false,
+            audio_device: None,
+            sensitivity: 1.2,
+            work_min: 25,
+            rest_min: 5,
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -1355,7 +1396,14 @@ mod tests {
         });
         assert_eq!(app.light.mode, defaults.0);
         assert_eq!(app.keys, defaults.1);
-        assert_eq!((app.light.brightness.get(), app.light.speed.get(), app.key_brightness.get()), (5, 5, 5));
+        assert_eq!(
+            (
+                app.light.brightness.get(),
+                app.light.speed.get(),
+                app.key_brightness.get()
+            ),
+            (5, 5, 5)
+        );
         assert_eq!(app.light.direction, Direction::Right);
         assert_eq!((app.sensitivity, app.work_min, app.rest_min), (1.2, 5, 30));
 
@@ -1365,6 +1413,15 @@ mod tests {
         saved.direction = 2;
         app.restore(saved);
         assert_eq!((app.light.mode.name(), app.light.direction), ("Breath", Direction::Up));
+    }
+
+    #[test]
+    fn missing_settings_fields_take_defaults_not_zero() {
+        let s: Saved = ron::from_str("(mode: \"Breath\")").unwrap();
+        assert_eq!(
+            (s.mode.as_str(), s.brightness, s.work_min, s.keys.len()),
+            ("Breath", 5, 25, KEYS.len())
+        );
     }
 
     #[test]

@@ -146,6 +146,11 @@ pub enum Direction {
     Down = 3,
 }
 
+impl Direction {
+    /// Indexed by the wire value.
+    pub const ALL: [Direction; 4] = [Direction::Left, Direction::Right, Direction::Up, Direction::Down];
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Light {
     pub mode: Mode,
