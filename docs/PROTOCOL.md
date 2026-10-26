@@ -51,6 +51,8 @@ The driver's write path (FUN_0044eeb0) reads the replies but **never checks them
 | `04 18`, `04 13 01`, `04 02` (header but **no data packet**) | The board applied it and the lighting changed. A header without its data is the real danger. |
 | `04 18`, `04 02` (nothing in between) | `04 02` replied `FF` and nothing changed. An empty transaction is rejected. |
 | `04 F5` read | Works; see below. |
+| Static colour `FF0000` / `00FF00` / `0000FF` | Correct colour. |
+| Static colour `FF2D2D` (red with a little green and blue) | Looks nearly white on the LEDs, yet `04 F5` reports the colour that was sent. The LEDs are strongly non-linear, which the app's colour curve compensates for. |
 
 ## Commands
 

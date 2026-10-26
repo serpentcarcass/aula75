@@ -9,7 +9,7 @@ Written in Rust with an [egui](https://github.com/emilk/egui) interface. The ven
 
 | | |
 |---|---|
-| **Lighting** | The 19 built-in effects plus "off", with colour, rainbow, brightness, speed and direction. Each effect only shows the settings it supports. The preview **mirrors the keyboard**: it shows the colours the keyboard reports it is displaying. |
+| **Lighting** | The 19 built-in effects plus "off", with colour, rainbow, brightness, speed and direction. Each effect only shows the settings it supports. The preview **mirrors the keyboard**: it shows the colours the keyboard reports it is displaying. **Pure R/G/B/W** buttons and a **colour curve** with one-click calibration (see below). |
 | **Per-key** | Paint individual keys and store them in the keyboard's user-lighting slot. **Load from keyboard** copies what it currently shows. |
 | **Live** | Effects computed on your computer and streamed in real time. Nothing is written to the keyboard's memory. <br>• **Music**: a spectrum visualiser driven by system audio (whatever is playing) or a microphone <br>• **Pomodoro**: F1–F12 burn down as a timer, and the board pulses when the phase changes <br>• **Effects**: the vendor driver's own nine real-time effects (Star, Rain, Flower, Breath, Spectrum, Spring, Vertical, Roll, Rotate), ported from its code and colour tables |
 | **Screen** | Put a PNG, JPG or animated GIF on the 128×128 TFT, or make one: rendered text (static or scrolling) or 32×32 pixel art. Up to 255 frames, with an animated preview. |
@@ -96,6 +96,14 @@ The keyboard has to be connected **by USB cable**. The 2.4 GHz dongle and Blueto
 - **Live**: choose Music, Pomodoro or one of the vendor Effects, then **Start live** and **Stop**. Settings take effect when you start.
 - **Screen**: choose Image (drop a file onto the window), Text (then **Render**) or Pixel art. Tick the confirmation, then press **Upload to screen**. This replaces the animation stored on the keyboard.
 - **Clock**: press **Sync clock**.
+
+### Colours look washed out?
+
+These LEDs are very non-linear. Pure red, green and blue look right, but a colour with even a little of a second channel (pastels, oranges, pinks) can look almost white.
+
+- **Calibrate:** in Lighting, press **Calibrate…**. Each keyboard row now shows orange and purple through a different curve. Click the row that looks most like the colours on screen.
+- **Adjust by hand:** move **Colour curve** yourself (1.0 = off).
+- **What it affects:** everything sent to the keyboard, including lighting, per-key and live effects, and the command line too.
 
 ### Command line
 
