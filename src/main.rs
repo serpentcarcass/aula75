@@ -1,3 +1,4 @@
+mod cli;
 mod effects;
 mod layout;
 mod proto;
@@ -103,7 +104,6 @@ fn spawn_worker(
     thread::spawn(move || {
         let mut kb: Option<Keyboard> = None;
         let mut fx: Option<Box<dyn Effect>> = None;
-        let mut locked_at: Option<u32> = None; // plug counter value when a write failed
         let mut busy_frames = 0u32; // consecutive live frames the keyboard declined
         let mut mirror = false;
         let mut next_poll = Instant::now();
@@ -119,10 +119,8 @@ fn spawn_worker(
         loop {
             let wait = if fx.is_some() {
                 next.saturating_duration_since(Instant::now())
-            } else if mirror && locked_at.is_none() {
-                next_poll.saturating_duration_since(Instant::now())
             } else if mirror {
-                Duration::from_secs(1) // locked: keep checking for the replug
+                next_poll.saturating_duration_since(Instant::now())
             } else {
                 Duration::from_secs(3600)
             };
@@ -136,9 +134,6 @@ fn spawn_worker(
                 seen_plugs = plugs;
                 kb = None; // replugged: the old handle is dead, reopen on next use
             }
-            if locked_at.is_some_and(|at| plugs > at) {
-                locked_at = None; // replugged: firmware state is fresh again
-            }
             if let Some(Job::Mirror(on)) = job {
                 mirror = on;
                 if !on {
@@ -148,7 +143,6 @@ fn spawn_worker(
             }
             if let Some(job) = job {
                 let res = match job {
-                    _ if locked_at.is_some() && !matches!(job, Job::StopLive) => Err(anyhow::anyhow!(LOCKED)),
                     Job::Live(cfg) => {
                         let made: Result<Box<dyn Effect>> = match cfg {
                             LiveCfg::Music { device, sensitivity } => {
@@ -187,7 +181,10 @@ fn spawn_worker(
                     Job::Mirror(_) => unreachable!("handled above"),
                 };
                 if res.as_ref().is_err_and(|e| e.is::<WriteFailed>()) {
-                    locked_at = Some(usb.plugs.load(Relaxed));
+                    // Every process now refuses this board until it is replugged (Keyboard::open).
+                    if let Some(k) = &kb {
+                        k.mark_interrupted();
+                    }
                     fx = None;
                     kb = None;
                     view.lock().unwrap().mirror.clear(); // no stale "live" preview while locked
@@ -197,7 +194,7 @@ fn spawn_worker(
                 continue;
             }
 
-            if fx.is_none() && mirror && locked_at.is_none() && Instant::now() >= next_poll {
+            if fx.is_none() && mirror && Instant::now() >= next_poll {
                 next_poll = Instant::now() + MIRROR_EVERY;
                 // Read-only, like the driver's own polling: a failure stops mirroring but doesn't lock.
                 match device(&mut kb).and_then(|k| k.read_leds()) {
@@ -251,7 +248,9 @@ fn spawn_worker(
                 Err(err) => {
                     // A real I/O failure mid-frame: stop, and lock writes until replug.
                     if err.is::<WriteFailed>() {
-                        locked_at = Some(usb.plugs.load(Relaxed));
+                        if let Some(k) = &kb {
+                            k.mark_interrupted();
+                        }
                         view.lock().unwrap().mirror.clear();
                     }
                     fx = None;
@@ -266,8 +265,6 @@ fn spawn_worker(
 }
 
 const SYSTEM_AUDIO: &str = "System audio (what's playing)";
-
-const LOCKED: &str = "A previous write was interrupted. Unplug the keyboard for a few seconds and plug it back in.";
 
 /// Marks an error that happened after talking to the device (vs. failing to open it).
 #[derive(Debug)]
@@ -1473,6 +1470,14 @@ fn style(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if !args.is_empty() {
+        if let Err(e) = cli::run(&args) {
+            eprintln!("aula-control: {e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AULA F75 Max")

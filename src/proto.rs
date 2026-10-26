@@ -17,6 +17,11 @@
 use crate::layout::KEYS;
 use anyhow::{Context, Result, bail, ensure};
 use hidapi::{HidApi, HidDevice};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::{
     thread::sleep,
     time::{Duration, Instant},
@@ -293,6 +298,67 @@ fn check_ack(cmd: Cmd, r: &[u8; 64]) -> Result<()> {
 pub struct Keyboard {
     cmd: HidDevice,
     bulk: Option<HidDevice>,
+    /// Identifies this plug-in of the board; changes when it is replugged.
+    instance: String,
+    _lock: File,
+}
+
+pub const INTERRUPTED: &str =
+    "A previous write was interrupted. Unplug the keyboard for a few seconds and plug it back in.";
+
+/// Per-user runtime directory for the process lock and the interrupted-write marker.
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Opens `path` without following a symlink (the fallback dir may be a shared /tmp).
+fn open_private(path: &Path, truncate: bool) -> std::io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(truncate)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Only one process (GUI window or CLI command) may hold the keyboard at a time.
+fn take_lock(dir: &Path) -> Result<File> {
+    let f = open_private(&dir.join("aula75.lock"), false)?;
+    // SAFETY: flock on a file descriptor we own.
+    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    ensure!(
+        r == 0,
+        "the keyboard is in use by another aula75 window or command; close it first"
+    );
+    Ok(f)
+}
+
+/// Refuses while an interrupted-write marker names this same plug-in of the board;
+/// a marker for an older plug-in means it has been replugged since, so it's cleared.
+fn check_interrupted(dir: &Path, instance: &str) -> Result<()> {
+    let marker = dir.join("aula75.interrupted");
+    match std::fs::read_to_string(&marker) {
+        Ok(s) if s == instance => bail!(INTERRUPTED),
+        Ok(_) => Ok(std::fs::remove_file(&marker)?),
+        Err(_) => Ok(()),
+    }
+}
+
+/// A string that changes whenever the board re-enumerates: on macOS hidapi's path carries the
+/// IORegistry entry id; on Linux the sysfs HID device name has a per-plug instance counter.
+fn instance_id(info: &hidapi::DeviceInfo) -> String {
+    let path = info.path().to_string_lossy().into_owned();
+    #[cfg(target_os = "linux")]
+    if let Some(name) = Path::new(&path).file_name() {
+        if let Ok(p) = std::fs::canonicalize(Path::new("/sys/class/hidraw").join(name).join("device")) {
+            return p.display().to_string();
+        }
+    }
+    path
 }
 
 impl Keyboard {
@@ -312,11 +378,30 @@ impl Keyboard {
         if !KNOWN_FIRMWARE.contains(&fw) {
             bail!("firmware {fw:#06x} not verified with this tool, refusing to write");
         }
+        let dir = runtime_dir();
+        let lock = take_lock(&dir)?;
+        let instance = instance_id(info);
+        check_interrupted(&dir, &instance)?;
         let cmd = info
             .open_device(&api)
             .context("cannot open command interface (permissions?)")?;
         let bulk = find(BULK_PAGE).and_then(|d| d.open_device(&api).ok());
-        Ok(Self { cmd, bulk })
+        Ok(Self {
+            cmd,
+            bulk,
+            instance,
+            _lock: lock,
+        })
+    }
+
+    /// Call after a write failed mid-transaction: every process refuses this board until it is
+    /// replugged, so a later `04 02` can't commit the half-written state.
+    pub fn mark_interrupted(&self) {
+        let written = open_private(&runtime_dir().join("aula75.interrupted"), true)
+            .and_then(|mut f| f.write_all(self.instance.as_bytes()));
+        if let Err(e) = written {
+            eprintln!("aula75: could not record the interrupted write: {e}");
+        }
     }
 
     fn send(&self, p: &[u8; 64]) -> Result<()> {
@@ -522,6 +607,19 @@ mod tests {
 
     #[test]
     fn packets() {
+        // Cross-process guards, in a private temp dir.
+        let dir = std::env::temp_dir().join(format!("aula75-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let held = take_lock(&dir).unwrap();
+        assert!(take_lock(&dir).is_err(), "second holder must be refused");
+        drop(held);
+        assert!(take_lock(&dir).is_ok());
+        std::fs::write(dir.join("aula75.interrupted"), "plug-1").unwrap();
+        assert!(check_interrupted(&dir, "plug-1").is_err(), "same plug-in stays locked");
+        assert!(check_interrupted(&dir, "plug-2").is_ok(), "replug clears it");
+        assert!(!dir.join("aula75.interrupted").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+
         let mode = Mode::all().find(|m| m.name() == "Static").unwrap();
         let l = Light {
             mode,

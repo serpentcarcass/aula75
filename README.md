@@ -79,7 +79,23 @@ The keyboard has to be connected **by USB cable**. The 2.4 GHz dongle and Blueto
 - **Screen**: drop an image onto the window, confirm the checkbox, then press **Upload to screen**.
 - **Clock**: press **Sync clock**.
 
-If you see *"A previous write was interrupted"*, unplug the keyboard for a few seconds and plug it back in.
+### Command line
+
+Run with a command instead of opening the window, e.g. from scripts or hooks:
+
+```sh
+aula-control modes
+aula-control light breath color=00c8ff brightness=4 speed=2
+aula-control light rolling rainbow dir=left
+aula-control clock
+aula-control screen cat.gif --yes
+aula-control live pomodoro focus=50 break=10   # Ctrl-C to stop
+aula-control live music                        # system audio
+```
+
+Only one window or command can hold the keyboard at a time. Out-of-range values are rejected instead of being clamped.
+
+If you see *"A previous write was interrupted"*, unplug the keyboard for a few seconds and plug it back in. This lock is shared by the window and the command line, and it survives restarts.
 
 ## Development
 
