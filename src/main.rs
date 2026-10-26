@@ -298,6 +298,16 @@ impl App {
         let view = Arc::new(Mutex::new(LiveView::default()));
         let usb = spawn_presence(cc.egui_ctx.clone());
         let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone());
+        let mut app = Self::with(jobs, msgs, usb, view);
+        app.audio_devices = effects::input_devices();
+        if let Some(s) = cc.storage.and_then(|st| eframe::get_value::<Saved>(st, eframe::APP_KEY)) {
+            app.restore(s);
+        }
+        app
+    }
+
+    /// Default state around already-running worker channels.
+    fn with(jobs: mpsc::Sender<Job>, msgs: mpsc::Receiver<Msg>, usb: Arc<Presence>, view: Arc<Mutex<LiveView>>) -> Self {
         Self {
             jobs,
             msgs,
@@ -323,12 +333,58 @@ impl App {
             screen_confirm: false,
             view,
             live_kind: LiveKind::Music,
-            audio_devices: effects::input_devices(),
+            audio_devices: vec![],
             audio_device: None,
             sensitivity: 1.2,
             work_min: 25,
             rest_min: 5,
         }
+    }
+
+    fn saved(&self) -> Saved {
+        Saved {
+            mode: self.light.mode.name().into(),
+            rgb: self.light.rgb,
+            rainbow: self.light.rainbow,
+            brightness: self.light.brightness.get(),
+            speed: self.light.speed.get(),
+            direction: self.light.direction as u8,
+            keys: self.keys.clone(),
+            brush: self.brush,
+            key_brightness: self.key_brightness.get(),
+            pomodoro: self.live_kind == LiveKind::Pomodoro,
+            audio_device: self.audio_device.clone(),
+            sensitivity: self.sensitivity,
+            work_min: self.work_min,
+            rest_min: self.rest_min,
+        }
+    }
+
+    /// The settings file is user-editable, so every value goes back through the same
+    /// validating constructors as the UI; anything unknown or out of range keeps the default.
+    fn restore(&mut self, s: Saved) {
+        if let Some(m) = Mode::all().find(|m| m.name() == s.mode) {
+            self.light.mode = m;
+        }
+        self.light.rgb = s.rgb;
+        self.light.rainbow = s.rainbow;
+        self.light.brightness = Level::new(s.brightness);
+        self.light.speed = Level::new(s.speed);
+        if let Some(d) = [Direction::Left, Direction::Right, Direction::Up, Direction::Down].get(s.direction as usize) {
+            self.light.direction = *d;
+        }
+        if s.keys.len() == KEYS.len() {
+            self.keys = s.keys;
+        }
+        self.brush = s.brush;
+        self.key_brightness = Level::new(s.key_brightness);
+        self.live_kind = if s.pomodoro { LiveKind::Pomodoro } else { LiveKind::Music };
+        self.audio_device = s.audio_device;
+        if s.sensitivity.is_finite() {
+            self.sensitivity = s.sensitivity.clamp(0.5, 3.0);
+        }
+        self.work_min = s.work_min.clamp(5, 90);
+        self.rest_min = s.rest_min.clamp(1, 30);
     }
 
     fn run(&mut self, job: Job) {
@@ -1145,7 +1201,31 @@ fn nav(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool) -> bool {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
+/// What survives a restart. Plain values only; `App::restore` re-validates them.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct Saved {
+    mode: String,
+    rgb: [u8; 3],
+    rainbow: bool,
+    brightness: u8,
+    speed: u8,
+    direction: u8,
+    keys: Vec<[u8; 3]>,
+    brush: [u8; 3],
+    key_brightness: u8,
+    pomodoro: bool,
+    audio_device: Option<String>,
+    sensitivity: f32,
+    work_min: u32,
+    rest_min: u32,
+}
+
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, eframe::APP_KEY, &self.saved());
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(m) = self.msgs.try_recv() {
             match m {
@@ -1254,6 +1334,38 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_validates_untrusted_settings() {
+        let (jobs, _) = mpsc::channel();
+        let (_, msgs) = mpsc::channel();
+        let mut app = App::with(jobs, msgs, Default::default(), Default::default());
+        let defaults = (app.light.mode, app.keys.clone());
+        app.restore(Saved {
+            mode: "Definitely Not A Mode".into(),
+            brightness: 200,
+            speed: 99,
+            direction: 7,
+            keys: vec![[1, 2, 3]; 3], // wrong length
+            key_brightness: 255,
+            sensitivity: f32::NAN,
+            work_min: 0,
+            rest_min: 10_000,
+            ..Default::default()
+        });
+        assert_eq!(app.light.mode, defaults.0);
+        assert_eq!(app.keys, defaults.1);
+        assert_eq!((app.light.brightness.get(), app.light.speed.get(), app.key_brightness.get()), (5, 5, 5));
+        assert_eq!(app.light.direction, Direction::Right);
+        assert_eq!((app.sensitivity, app.work_min, app.rest_min), (1.2, 5, 30));
+
+        // And a good file round-trips.
+        let mut saved = app.saved();
+        saved.mode = "Breath".into();
+        saved.direction = 2;
+        app.restore(saved);
+        assert_eq!((app.light.mode.name(), app.light.direction), ("Breath", Direction::Up));
+    }
 
     #[test]
     fn write_failures_are_tagged_for_the_replug_lock() {

@@ -11,10 +11,11 @@ publish = false
 [dependencies]
 anyhow = "1.0.104"
 cpal = "0.18.2"
-eframe = "0.37.0"
+eframe = { version = "0.37.0", features = ["persistence"] }
 hidapi = "2.6.7"
 image = { version = "0.25.10", default-features = false, features = ["gif", "png", "jpeg"] }
 libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
 
 # PipeWire host lets us record what's playing (sink capture) on Linux; needs libpipewire-0.3-dev + clang.
 [target.'cfg(target_os = "linux")'.dependencies]
