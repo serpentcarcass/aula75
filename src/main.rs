@@ -839,7 +839,7 @@ impl App {
         {
             if resp.secondary_clicked() {
                 self.brush = self.keys[i];
-            } else if resp.dragged_by(egui::PointerButton::Primary) || resp.clicked() {
+            } else if resp.is_pointer_button_down_on() {
                 self.keys[i] = self.brush;
             }
         }
@@ -891,11 +891,14 @@ impl App {
                 match &self.preview {
                     Some(tex) => {
                         // Animate: pick the frame for the current time from the frame delays.
-                        let total: u64 = self.frames.iter().map(|f| f.1.max(30) as u64).sum();
+                        // Same delay clamp as the device, so the preview plays at its speed.
+                        let delay =
+                            |f: &screen::Frame| f.1.clamp(*proto::DELAY_MS.start(), *proto::DELAY_MS.end()) as u64;
+                        let total: u64 = self.frames.iter().map(delay).sum();
                         if self.frames.len() > 1 && total > 0 {
                             let mut t = (ui.input(|i| i.time) * 1000.0) as u64 % total;
                             let idx = self.frames.iter().position(|f| {
-                                let d = f.1.max(30) as u64;
+                                let d = delay(f);
                                 if t < d {
                                     true
                                 } else {
@@ -1142,7 +1145,8 @@ impl App {
 
     /// New frames for the preview and the upload; a new picture always needs a fresh confirm.
     fn set_frames(&mut self, ctx: &egui::Context, f: Vec<screen::Frame>) {
-        let img = egui::ColorImage::from_rgba_unmultiplied([proto::SCREEN; 2], &f[0].0);
+        let Some(first) = f.first() else { return };
+        let img = egui::ColorImage::from_rgba_unmultiplied([proto::SCREEN; 2], &first.0);
         self.preview = Some(ctx.load_texture("screen", img, egui::TextureOptions::NEAREST));
         self.preview_idx = 0;
         self.frames = f;
@@ -1178,6 +1182,7 @@ impl App {
         card(ui, "Text", |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut self.text)
+                    .char_limit(300)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY),
             );
@@ -1233,9 +1238,7 @@ impl App {
             let i = y.min(PIXEL_SIDE - 1) * PIXEL_SIDE + x.min(PIXEL_SIDE - 1);
             if resp.secondary_clicked() {
                 self.pixel_brush = self.pixels[i];
-            } else if (resp.dragged_by(egui::PointerButton::Primary) || resp.clicked())
-                && self.pixels[i] != self.pixel_brush
-            {
+            } else if resp.is_pointer_button_down_on() && self.pixels[i] != self.pixel_brush {
                 self.pixels[i] = self.pixel_brush;
                 changed = true;
             }
@@ -1251,7 +1254,9 @@ impl App {
             Stroke::new(1.0, Color32::from_gray(60)),
             egui::StrokeKind::Outside,
         );
-        if changed || self.frames.is_empty() || ui.button("Use as screen image").clicked() {
+        // Button drawn every frame (not short-circuited away while painting).
+        let use_it = ui.button("Use this drawing").clicked();
+        if changed || use_it {
             let f = vec![screen::pixel_frame(&self.pixels, PIXEL_SIDE)];
             self.set_frames(ui.ctx(), f);
         }

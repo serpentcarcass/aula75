@@ -48,6 +48,7 @@ pub fn load_frames(path: &Path) -> Result<Vec<Frame>> {
 }
 
 const SCROLL_DELAY_MS: u32 = 40;
+const MAX_SCROLL_STEP: f32 = 8.0;
 
 /// Renders `text` in Hack (egui's bundled monospace font). Static: each line centred.
 /// `scroll`: one line moving right to left, never more than the screen's 255 frames.
@@ -66,7 +67,19 @@ pub fn text_frames(text: &str, size: f32, fg: Rgb, bg: Rgb, scroll: bool) -> Vec
         }
         return vec![(img, 1000)];
     }
-    let line = text.lines().collect::<Vec<_>>().join("   ");
+    // At most MAX_SCROLL_STEP px per frame within 255 frames, else it's unreadable: cut the tail.
+    let budget = MAX_FRAMES as f32 * MAX_SCROLL_STEP - n;
+    let mut used = 0.0;
+    let line: String = text
+        .lines()
+        .collect::<Vec<_>>()
+        .join("   ")
+        .chars()
+        .take_while(|&c| {
+            used += sf.h_advance(sf.glyph_id(c));
+            used <= budget
+        })
+        .collect();
     let span = width(&line) + n; // enters on the right, leaves on the left
     let step = (span / MAX_FRAMES as f32).ceil().max(2.0);
     let baseline = (n - sf.height()) / 2.0 + sf.ascent();
@@ -101,8 +114,16 @@ fn draw(img: &mut [u8], font: &FontRef, size: f32, text: &str, x: f32, baseline:
     let mut caret = x;
     for c in text.chars() {
         let id = sf.glyph_id(c);
+        let advance = sf.h_advance(id);
+        if caret > SCREEN as f32 {
+            break; // the rest is off the right edge
+        }
+        if caret + advance < 0.0 {
+            caret += advance; // still off the left edge: skip rasterising
+            continue;
+        }
         let glyph = id.with_scale_and_position(PxScale::from(size), point(caret, baseline));
-        caret += sf.h_advance(id);
+        caret += advance;
         let Some(out) = font.outline_glyph(glyph) else { continue };
         let b = out.px_bounds();
         out.draw(|gx, gy, cov| {
@@ -132,6 +153,12 @@ mod tests {
         let long = "a very long marquee line that would need far too many frames at two px each ".repeat(20);
         let scroll = text_frames(&long, 30.0, [255; 3], [0; 3], true);
         assert!((1..=MAX_FRAMES).contains(&scroll.len()), "{} frames", scroll.len());
+        let t = std::time::Instant::now();
+        text_frames(&"x".repeat(20_000), 96.0, [255; 3], [0; 3], true);
+        assert!(
+            t.elapsed().as_secs() < 5,
+            "huge text stays fast (off-screen glyphs skipped, tail cut)"
+        );
         assert!(
             text_frames("", 30.0, [255; 3], [0; 3], false)[0]
                 .0

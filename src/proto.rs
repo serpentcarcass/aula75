@@ -39,7 +39,9 @@ const DELAY: Duration = Duration::from_millis(35);
 
 pub const SCREEN: usize = 128;
 pub const FRAME_BYTES: usize = SCREEN * SCREEN * 2;
-pub const MAX_FRAMES: usize = 255; // <screen gif_maxframes="255"/>
+pub const MAX_FRAMES: usize = 255;
+/// Frame delays the screen accepts (driver UI: "30-500").
+pub const DELAY_MS: std::ops::RangeInclusive<u32> = 30..=500; // <screen gif_maxframes="255"/>
 const GIF_HEADER: usize = 256; // <screen gif_headlength="256"/>
 const PAGE: usize = 4096;
 
@@ -193,7 +195,7 @@ impl Animation {
         let mut out = Vec::with_capacity(frames.len());
         for (i, (rgba, delay)) in frames.iter().enumerate() {
             ensure!(rgba.len() == SCREEN * SCREEN * 4, "frame {i} is not {SCREEN}x{SCREEN}");
-            out.push((rgb565(rgba), (*delay).clamp(30, 500)));
+            out.push((rgb565(rgba), (*delay).clamp(*DELAY_MS.start(), *DELAY_MS.end())));
         }
         Ok(Self(out))
     }
