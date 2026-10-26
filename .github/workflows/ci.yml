@@ -10,12 +10,13 @@ permissions:
   contents: read
 
 jobs:
-  linux:
+  # Read-only: builds, lints and tests every push; on v* tags also packages the binary.
+  build:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write # only used to attach binaries to a release on v* tags
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: System libraries
         run: |
@@ -24,28 +25,45 @@ jobs:
             pkg-config clang libclang-dev libudev-dev libpipewire-0.3-dev libspa-0.2-dev \
             libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned toolchain so a new Rust release's lints can't break CI under -D warnings.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: 1.97.1
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - run: cargo build --release
 
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
+          cargo build --release
           name="aula-control-${GITHUB_REF_NAME}-linux-x86_64"
           mkdir "$name"
           cp target/release/aula-control 70-aula-f75max.rules README.md LICENSE "$name/"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: aula-control-*-linux-x86_64.tar.gz*
+
+  # The only job with write access: no repo code runs here, it just attaches the artifacts.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: aula-control-*-linux-x86_64.tar.gz*
