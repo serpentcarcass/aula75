@@ -42,6 +42,16 @@ Writes are wrapped in a transaction:
 04 F0            finish (lighting and per-key only)
 ```
 
+The driver's write path (FUN_0044eeb0) reads the replies but **never checks them**. Busy (`FF`) replies are normal right after an apply, while the board is saving. This tool waits 250 ms after a stored write, re-reads a busy reply for up to ~150 ms, and stops before sending anything else if `04 18` itself stays busy.
+
+### Confirmed on hardware
+
+| Sequence | Result |
+|---|---|
+| `04 18`, `04 13 01`, `04 02` (header but **no data packet**) | The board applied it and the lighting changed. A header without its data is the real danger. |
+| `04 18`, `04 02` (nothing in between) | `04 02` replied `FF` and nothing changed. An empty transaction is rejected. |
+| `04 F5` read | Works; see below. |
+
 ## Commands
 
 ### `04 13`: lighting effect (FUN_0042b0d0)
@@ -90,6 +100,20 @@ This is used for streaming. The vendor streams it continuously for its "Real-tim
 2. 512 bytes in 8 packets, 2 ms apart. The driver aborts if this takes longer than 100 ms. The records are `[led, R, G, B]` **packed back to back** (not at `led*4`), zero padded, with no trailer.
 3. `04 02`: set, wait 5 ms, get. On `FF`, resend once. The driver ignores the final status.
 
+For its Real-time Lighting page (FUN_00427dc0) the driver sends each key's colour as `(R, G, B) * alpha >> 8`, where alpha is the effect's per-key brightness.
+
+### `04 F5`: read the current LED colours (FUN_0042aeb0, transport FUN_0044f380)
+
+Read-only. The driver's Lighting page polls it continuously to mirror the board in its UI. **Confirmed on hardware.**
+
+1. `04 F5` with arg `09`: set, wait 5 ms, get. The reply must echo `04 F5` with status `01`. Otherwise nothing more is sent, which is how the driver behaves.
+2. 9 feature-report reads, 3 ms apart, each allowed up to 360 ms. Each read returns 65 bytes; bytes 1..65 are the data, 576 bytes in total.
+3. `04 02`.
+
+The data is `[led, R, G, B]` at offset `led*4`, the same layout as `04 23`. The values are what the LEDs show right now, including animated effects.
+
+The driver first tries a 9-byte read that always fails on Windows before any USB traffic. That read is skipped here, because on other OSes it could consume the reply.
+
 ### `04 28`: screen clock (FUN_004238f0)
 
 The header arg is `01`. It is followed by one data packet, which **is** read back:
@@ -128,9 +152,31 @@ The following appear in the driver but are **not implemented**. Their meaning is
 | Command | Where | Likely purpose |
 |---|---|---|
 | `04 11` / `04 27` | FUN_004183d0 | Key remapping for the base layer and the Fn layer |
-| `04 F5` arg `09` | FUN_0042aeb0 | Reads stored per-key colours back |
 | `04 15`, `04 19` | FUN_0042d6d0 | Unknown, probably macros |
 | `04 17` | FUN_00414020 | Unknown |
 | `04 2b` | FUN_00418020 | Unknown |
 
 Firmware update and factory reset paths exist in the driver too. They were deliberately not examined for use.
+
+## Vendor real-time effects (mui.dll)
+
+The driver's Real-time Lighting page runs its effects on the host and streams them with `04 20`. The code is in `MUI::CustomLightMode::Update*Effect`:
+
+| Effect | Behaviour |
+|---|---|
+| Star | Each key fades from 255 to 0, then picks the next colour from a 107-colour palette. |
+| Rain | Drops fall down the matrix columns in palette colours. |
+| Flower | Each key cycles through a 192-step colour wave from its own phase. |
+| Breath | Fixed per-column colours with a 128-step breathing curve. |
+| Spectrum | The whole board cycles through a spectrum table that peaks at 63, so it is dim. |
+| Spring | Rainbow and brightness waves run outwards over 12 rings of keys centred on `O`. |
+| Rotate | The same waves run over 45 sectors of three keys each. |
+| Vertical | The same waves run along the matrix rows. |
+| Roll | The same waves run along the matrix columns. |
+
+Details:
+
+- **Update rate.** `SetSpeed` maps speed 1..15 to updating every 14..0 timer ticks.
+- **Palette "randomness".** The walk calls `srand(0xe8)` before every `rand()`, so `rand()` always returns 796 and the walk is really a counter.
+- **Tables.** The tables are copied in `src/vendor_tables.rs`.
+- **Not reversed.** The initial phases and the timer period were not reversed. This port spreads the phases evenly and assumes a 10 ms tick.
