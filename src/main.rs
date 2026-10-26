@@ -2,6 +2,7 @@ mod cli;
 mod effects;
 mod layout;
 mod proto;
+mod tray;
 
 use anyhow::{Context, Result};
 use effects::{Effect, Rgb};
@@ -385,6 +386,11 @@ struct App {
     mirror_sent: bool,
     /// Shared with the worker: gamma-correct colours sent to the keyboard.
     vivid: Arc<AtomicBool>,
+    /// Status-bar icon (Linux with a tray host); with it, closing the window only hides it.
+    tray: Option<tray::Tray>,
+    tray_live: bool,
+    hidden: bool,
+    quitting: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -402,6 +408,8 @@ impl App {
         let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone(), vivid.clone());
         let mut app = Self::with(jobs, msgs, usb, view);
         app.vivid = vivid;
+        let ctx = cc.egui_ctx.clone();
+        app.tray = tray::spawn(Box::new(move || ctx.request_repaint()));
         app.audio_devices = effects::input_devices();
         if let Some(s) = cc
             .storage
@@ -452,6 +460,10 @@ impl App {
             mirror_on: false,
             mirror_sent: false,
             vivid: Default::default(),
+            tray: None,
+            tray_live: false,
+            hidden: false,
+            quitting: false,
         };
         app.restore(Saved::default()); // single source of defaults
         app
@@ -509,6 +521,19 @@ impl App {
         self.rest_min = s.rest_min.clamp(*BREAK_MIN.start(), *BREAK_MIN.end());
         self.vivid.store(s.vivid, Relaxed);
         self.mirror_on = s.mirror;
+    }
+
+    fn live_cfg(&self, kind: LiveKind) -> LiveCfg {
+        match kind {
+            LiveKind::Music => LiveCfg::Music {
+                device: self.audio_device.clone(),
+                sensitivity: self.sensitivity,
+            },
+            LiveKind::Pomodoro => LiveCfg::Pomodoro {
+                work: self.work_min,
+                rest: self.rest_min,
+            },
+        }
     }
 
     fn run(&mut self, job: Job) {
@@ -917,16 +942,7 @@ impl App {
                                 self.run(Job::StopLive);
                             }
                         } else if primary(ui, "Start live", ready) {
-                            self.run(Job::Live(match self.live_kind {
-                                LiveKind::Music => LiveCfg::Music {
-                                    device: self.audio_device.clone(),
-                                    sensitivity: self.sensitivity,
-                                },
-                                LiveKind::Pomodoro => LiveCfg::Pomodoro {
-                                    work: self.work_min,
-                                    rest: self.rest_min,
-                                },
-                            }));
+                            self.run(Job::Live(self.live_cfg(self.live_kind)));
                         }
                     }
                 }
@@ -1404,7 +1420,9 @@ impl eframe::App for App {
         eframe::set_value(storage, eframe::APP_KEY, &self.saved());
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Runs before every `ui` and also while the window is hidden (on repaint requests from the
+    /// worker or the tray), so status, tray commands and the mirror stay handled.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(m) = self.msgs.try_recv() {
             match m {
                 Msg::Progress(p) => self.progress = Some(p),
@@ -1420,11 +1438,49 @@ impl eframe::App for App {
                 }
             }
         }
-        let want = self.tab == Tab::Lighting && self.mirror_on && self.usb.present.load(Relaxed);
+        let want = !self.hidden && self.tab == Tab::Lighting && self.mirror_on && self.usb.present.load(Relaxed);
         if want != self.mirror_sent && self.jobs.send(Job::Mirror(want)).is_ok() {
             self.mirror_sent = want;
         }
 
+        let cmds: Vec<_> = self
+            .tray
+            .as_ref()
+            .map(|t| t.cmds.try_iter().collect())
+            .unwrap_or_default();
+        for cmd in cmds {
+            match cmd {
+                tray::TrayCmd::Show => {
+                    self.hidden = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                tray::TrayCmd::Music => self.run(Job::Live(self.live_cfg(LiveKind::Music))),
+                tray::TrayCmd::Pomodoro => self.run(Job::Live(self.live_cfg(LiveKind::Pomodoro))),
+                tray::TrayCmd::StopLive => self.run(Job::StopLive),
+                tray::TrayCmd::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        let live = self.view.lock().unwrap().running;
+        if let Some(t) = &self.tray
+            && live != self.tray_live
+        {
+            t.set_live(live);
+            self.tray_live = live;
+        }
+
+        // With a tray icon, the window's close button hides it; live effects keep running.
+        if self.tray.is_some() && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hidden = true;
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         egui::Panel::left("nav")
             .exact_size(200.0)
             .frame(Frame::new().fill(PANEL).inner_margin(16))
