@@ -1,0 +1,9 @@
+# Linux: let the logged-in user reach ONLY the two vendor interfaces of the AULA F75 Max
+# (02 = 0xFF68 screen, 03 = 0xFF13 commands). The typing interface (00) stays root-only,
+# so other user processes can't read keystrokes through hidraw.
+# Must sort before 73-seat-late.rules for TAG+="uaccess" to take effect.
+#   sudo cp 70-aula-f75max.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+# ATTRS in one rule must all match the same parent, so VID/PID (usb_device) and the
+# interface number (usb_interface) are matched in two steps.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="800a", ENV{AULA_F75}="1"
+SUBSYSTEM=="hidraw", ENV{AULA_F75}=="1", ATTRS{bInterfaceNumber}=="02|03", TAG+="uaccess"

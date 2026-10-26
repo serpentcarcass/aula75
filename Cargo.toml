@@ -1,0 +1,20 @@
+[package]
+name = "aula-control"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Unofficial lighting, screen and live-effects control for the AULA F75 Max keyboard (macOS & Linux)"
+repository = "https://github.com/serpentcarcass/aula75"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+cpal = "0.18.2"
+eframe = "0.37.0"
+hidapi = "2.6.7"
+image = { version = "0.25.10", default-features = false, features = ["gif", "png", "jpeg"] }
+libc = "0.2.191"
+
+# PipeWire host lets us record what's playing (sink capture) on Linux; needs libpipewire-0.3-dev + clang.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pipewire"] }
