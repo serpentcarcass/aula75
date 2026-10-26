@@ -305,9 +305,9 @@ fn device(kb: &mut Option<Keyboard>) -> Result<&Keyboard> {
 
 /// Runs a write, tagging its failure as `WriteFailed` (which locks writes until replug).
 fn write<T>(kb: &mut Option<Keyboard>, op: impl FnOnce(&Keyboard) -> Result<T>) -> Result<T> {
-    // `Busy` means refused before anything was written: no lock, just try again.
+    // `NotSent` means refused before anything was written: no lock, just try again.
     op(device(kb)?).map_err(|e| {
-        if e.is::<proto::Busy>() {
+        if e.is::<proto::NotSent>() {
             e
         } else {
             e.context(WriteFailed)

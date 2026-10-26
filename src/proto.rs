@@ -307,18 +307,20 @@ pub struct Keyboard {
     last_write: Cell<Option<Instant>>,
 }
 
-/// The keyboard was busy before anything but `04 18` was sent: nothing can be half-written,
-/// so it's safe to simply try again later (no replug needed).
+/// A stored write was refused before anything but (at most) `04 18` was sent, so nothing can be
+/// half-written: just try again later, no replug needed.
 #[derive(Debug)]
-pub struct Busy;
+pub struct NotSent(pub &'static str);
 
-impl std::fmt::Display for Busy {
+impl std::fmt::Display for NotSent {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("keyboard is busy, try again in a moment")
+        f.write_str(self.0)
     }
 }
 
-impl std::error::Error for Busy {}
+impl std::error::Error for NotSent {}
+
+const BUSY: NotSent = NotSent("keyboard is busy, try again in a moment");
 
 // Gap after a stored write before starting the next one (the board is busy saving it).
 const COOLDOWN: Duration = Duration::from_millis(250);
@@ -351,7 +353,11 @@ fn runtime_dir() -> Result<PathBuf> {
                 .into_owned(),
         )
     };
-    ensure!(dir.is_dir(), "runtime directory {} is missing", dir.display());
+    ensure!(
+        dir.is_dir(),
+        "runtime directory {} is missing; run aula-control from a normal desktop login session",
+        dir.display()
+    );
     Ok(dir)
 }
 
@@ -359,7 +365,7 @@ const MARKER: &str = "aula75.interrupted";
 
 /// Atomically records `instance` as "write in progress" (temp file + rename, no symlinks).
 fn set_marker(dir: &Path, instance: &str) -> Result<()> {
-    let tmp = dir.join(format!("{MARKER}.{}.tmp", std::process::id()));
+    let tmp = dir.join(format!("{MARKER}.tmp")); // single writer: we hold the flock
     let _ = std::fs::remove_file(&tmp);
     let mut f = OpenOptions::new()
         .write(true)
@@ -367,13 +373,13 @@ fn set_marker(dir: &Path, instance: &str) -> Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)?;
+    // No fsync: a killed process needs none, and after an OS crash the plug-in id changes anyway.
     f.write_all(instance.as_bytes())?;
-    f.sync_all()?;
     std::fs::rename(&tmp, dir.join(MARKER))?;
     Ok(())
 }
 
-/// Opens `path` without following a symlink (the fallback dir may be a shared /tmp).
+/// Opens `path` without following a symlink.
 fn open_private(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .create(true)
@@ -422,10 +428,10 @@ fn check_interrupted(dir: &Path, instance: &str) -> Result<()> {
 fn instance_id(info: &hidapi::DeviceInfo) -> String {
     let path = info.path().to_string_lossy().into_owned();
     #[cfg(target_os = "linux")]
-    if let Some(name) = Path::new(&path).file_name() {
-        if let Ok(p) = std::fs::canonicalize(Path::new("/sys/class/hidraw").join(name).join("device")) {
-            return p.display().to_string();
-        }
+    if let Some(name) = Path::new(&path).file_name()
+        && let Ok(p) = std::fs::canonicalize(Path::new("/sys/class/hidraw").join(name).join("device"))
+    {
+        return p.display().to_string();
     }
     path
 }
@@ -477,35 +483,32 @@ impl Keyboard {
     /// failure, panic, kill or closed window all leave it behind, and every process refuses
     /// this board until it is replugged. Without a marker on disk, nothing is written.
     fn guarded(&self, op: impl FnOnce() -> Result<()>) -> Result<()> {
-        set_marker(&self.dir, &self.instance).context("cannot record the write in progress; refusing to write")?;
+        set_marker(&self.dir, &self.instance)
+            .context(NotSent("cannot record the write in progress, so nothing was sent"))?;
         let res = op();
         self.last_write.set(Some(Instant::now()));
+        let clear = || std::fs::remove_file(self.dir.join(MARKER));
         match res {
+            Ok(()) => clear().context("write applied, but its safety marker could not be cleared"),
             // Refused at `04 18`: nothing was written, so no replug is needed.
-            Err(e) if !e.is::<Busy>() => Err(e),
-            r => {
-                std::fs::remove_file(self.dir.join(MARKER))
-                    .context("write applied, but its safety marker could not be cleared")?;
-                r
+            Err(e) if e.is::<NotSent>() => {
+                clear().context("nothing was written, but the safety marker could not be cleared")?;
+                Err(e)
             }
+            Err(e) => Err(e),
         }
     }
 
-    /// `04 18`, after the post-write cooldown. The driver ignores a busy reply here; we instead
-    /// retry, and if the board stays busy report `Busy` before sending anything else.
+    /// `04 18` once (like the driver), after the post-write cooldown. If the board still says busy
+    /// after re-reading, stop before sending anything else and report `NotSent`.
     fn begin(&self) -> Result<()> {
         if let Some(t) = self.last_write.get() {
             sleep(COOLDOWN.saturating_sub(t.elapsed()));
         }
-        for _ in 0..3 {
-            self.send(&Cmd::Begin.packet(0))?;
-            let r = self.settled_reply(Cmd::Begin)?;
-            if r[0] == 0x04 && r[1] == Cmd::Begin as u8 && r[3] != 0xff {
-                return Ok(());
-            }
-            sleep(Duration::from_millis(100));
-        }
-        Err(Busy.into())
+        self.send(&Cmd::Begin.packet(0))?;
+        let r = self.settled_reply(Cmd::Begin)?;
+        ensure!(r[0] == 0x04 && r[1] == Cmd::Begin as u8 && r[3] != 0xff, BUSY);
+        Ok(())
     }
 
     /// Reads the reply; while it says busy (FF), reads again (nothing is re-sent), up to ~150 ms.
@@ -635,7 +638,10 @@ impl Keyboard {
         self.command(Cmd::Light, 1)?;
         self.send(packet)?;
         self.command(Cmd::Apply, 0)?;
-        self.send(&Cmd::Finish.packet(0))
+        self.send(&Cmd::Finish.packet(0))?;
+        // set_per_key starts a second transaction right after this one: give the board its cooldown.
+        self.last_write.set(Some(Instant::now()));
+        Ok(())
     }
 
     pub fn set_light(&self, l: &Light) -> Result<()> {
@@ -662,8 +668,8 @@ impl Keyboard {
 
     /// Clock on the TFT, from the local time of this machine.
     pub fn sync_clock(&self) -> Result<()> {
+        let t = local_time()?; // before the guard: failing here sends nothing
         self.guarded(|| {
-            let t = local_time()?;
             let mut p = [0; 64];
             p[1] = 1;
             p[2] = 0x5a;
