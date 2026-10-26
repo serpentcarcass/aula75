@@ -18,6 +18,31 @@ pub trait Effect {
     fn label(&self) -> String {
         String::new()
     }
+    /// The colours are already final (skip the colour curve), e.g. the calibration pattern.
+    fn raw(&self) -> bool {
+        false
+    }
+}
+
+/// Curves shown on the six matrix rows during calibration (F row first).
+pub const CALIBRATION: [f32; 6] = [1.0, 1.6, 2.2, 2.8, 3.4, 4.0];
+/// Reference mixes: orange on the left half, purple on the right.
+pub const CAL_COLOURS: [Rgb; 2] = [[255, 128, 0], [128, 0, 255]];
+
+/// Each matrix row shows the reference mixes through a different curve; the user picks the row
+/// that looks most like the colours on screen. Nothing is stored on the keyboard.
+pub struct Calibration;
+
+impl Effect for Calibration {
+    fn frame(&mut self) -> Vec<Rgb> {
+        vt::KEY_MATRIX
+            .iter()
+            .map(|&(_, row, col)| curve(CAL_COLOURS[(col > 7) as usize], CALIBRATION[(row as usize).min(5)]))
+            .collect()
+    }
+    fn raw(&self) -> bool {
+        true
+    }
 }
 
 /// Key centres normalised to 0..1 (x left→right, y top→bottom).
@@ -616,6 +641,15 @@ mod tests {
         let mut c = 0;
         assert!((0..500).all(|_| next_palette(&mut c) < 107));
         assert_eq!(VendorFx::from_name("spring"), Some(VendorFx::Spring));
+    }
+
+    #[test]
+    fn calibration_rows() {
+        let f = Calibration.frame();
+        let esc = f[0]; // row 0: curve 1.0, left half
+        let space = f[KEYS.iter().position(|k| k.0 == "Space").unwrap()]; // row 5: curve 4.0
+        assert_eq!(esc, CAL_COLOURS[0]);
+        assert!(space[1] < esc[1], "steeper curve thins the green in orange");
     }
 
     #[test]

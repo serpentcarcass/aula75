@@ -61,6 +61,7 @@ enum LiveCfg {
     Music { device: Option<String>, sensitivity: f32 },
     Pomodoro { work: u32, rest: u32 },
     Vendor { fx: effects::VendorFx, speed: u8 },
+    Calibrate,
 }
 
 /// What the worker is currently streaming, for the on-screen preview.
@@ -163,6 +164,7 @@ fn spawn_worker(
                             }
                             LiveCfg::Pomodoro { work, rest } => Ok(Box::new(effects::Pomodoro::new(work, rest))),
                             LiveCfg::Vendor { fx, speed } => Ok(Box::new(effects::Vendor::new(fx, speed))),
+                            LiveCfg::Calibrate => Ok(Box::new(effects::Calibration)),
                         };
                         made.map(|e| {
                             fx = Some(e);
@@ -243,7 +245,7 @@ fn spawn_worker(
                 &leds
                     .iter()
                     .copied()
-                    .zip(colors.iter().map(|&c| out(c)))
+                    .zip(colors.iter().map(|&c| if e.raw() { c } else { out(c) }))
                     .collect::<Vec<_>>(),
             );
             let res = write(&mut kb, |k| k.stream(&frame));
@@ -402,6 +404,7 @@ struct App {
     mirror_sent: bool,
     /// Colour curve shared with the worker (f32 bits).
     curve: Arc<AtomicU32>,
+    calibrating: bool,
     /// Status-bar icon (Linux with a tray host); with it, closing the window only hides it.
     tray: Option<tray::Tray>,
     tray_live: bool,
@@ -502,6 +505,7 @@ impl App {
             mirror_on: false,
             mirror_sent: false,
             curve: Default::default(),
+            calibrating: false,
             tray: None,
             tray_live: false,
             hidden: false,
@@ -655,6 +659,8 @@ impl App {
             });
         ui.add_space(12.0);
 
+        let ready_to_test = !self.busy() && self.usb.present.load(Relaxed);
+        let (mut pick, mut start_cal): (Option<bool>, bool) = (None, false);
         let l = &mut self.light;
         ui.columns(2, |c| {
             card(&mut c[0], "Effect", |ui| {
@@ -706,6 +712,36 @@ impl App {
                             .on_hover_text("Raise if mixed colours look washed out on the keyboard. 1.0 = off. Applies to everything sent.");
                     });
                     self.curve.store(g.to_bits(), Relaxed);
+                    if self.calibrating {
+                        ui.add_space(4.0);
+                        label(ui, "Which keyboard row looks most like this?");
+                        ui.horizontal(|ui| {
+                            for c in effects::CAL_COLOURS {
+                                let (r, _) = ui.allocate_exact_size(Vec2::new(60.0, 24.0), Sense::hover());
+                                ui.painter().rect_filled(r, 6, rgb(c));
+                            }
+                            ui.label(RichText::new("left / right half").color(MUTED).size(12.0));
+                        });
+                        let rows = ["F row", "Numbers", "Q row", "A row", "Z row", "Space row"];
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, g) in rows.into_iter().zip(effects::CALIBRATION) {
+                                if ui.button(format!("{name} ({g:.1})")).clicked() {
+                                    self.curve.store(g.to_bits(), Relaxed);
+                                    pick = Some(true);
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                pick = Some(false);
+                            }
+                        });
+                    } else if ui
+                        .add_enabled(ready_to_test, egui::Button::new("Calibrate…"))
+                        .on_hover_text("Shows six curves on the keyboard rows; pick the row that looks right")
+                        .clicked()
+                    {
+                        pick = None;
+                        start_cal = true;
+                    }
                     ui.add_space(10.0);
                 }
                 if m.has_brightness() {
@@ -738,6 +774,20 @@ impl App {
                 }
             });
         });
+        // Calibration streams a test pattern (live frames, nothing stored) until a row is picked.
+        if start_cal {
+            self.calibrating = true;
+            self.run(Job::Live(LiveCfg::Calibrate));
+        }
+        if let Some(applied) = pick {
+            self.calibrating = false;
+            self.queue(Job::StopLive);
+            self.status = Ok(if applied {
+                "Colour curve set"
+            } else {
+                "Calibration cancelled"
+            });
+        }
     }
 
     fn per_key(&mut self, ui: &mut egui::Ui) {
