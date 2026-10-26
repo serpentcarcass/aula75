@@ -449,7 +449,7 @@ impl App {
             sensitivity: 0.0,
             work_min: 0,
             rest_min: 0,
-            mirror_on: false, // opt-in until `04 F5` has been confirmed on hardware
+            mirror_on: false,
             mirror_sent: false,
             vivid: Default::default(),
         };
@@ -474,6 +474,7 @@ impl App {
             work_min: self.work_min,
             rest_min: self.rest_min,
             vivid: self.vivid.load(Relaxed),
+            mirror: self.mirror_on,
         }
     }
 
@@ -507,6 +508,7 @@ impl App {
         self.work_min = s.work_min.clamp(*FOCUS_MIN.start(), *FOCUS_MIN.end());
         self.rest_min = s.rest_min.clamp(*BREAK_MIN.start(), *BREAK_MIN.end());
         self.vivid.store(s.vivid, Relaxed);
+        self.mirror_on = s.mirror;
     }
 
     fn run(&mut self, job: Job) {
@@ -1371,6 +1373,7 @@ struct Saved {
     work_min: u32,
     rest_min: u32,
     vivid: bool,
+    mirror: bool,
 }
 
 impl Default for Saved {
@@ -1390,7 +1393,8 @@ impl Default for Saved {
             sensitivity: 1.2,
             work_min: 25,
             rest_min: 5,
-            vivid: true,
+            vivid: false, // didn't visibly help on hardware; kept as an option
+            mirror: true, // 04 F5 confirmed on hardware
         }
     }
 }
