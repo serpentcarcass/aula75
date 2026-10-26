@@ -95,13 +95,10 @@ const MIRROR_EVERY: Duration = Duration::from_millis(100);
 /// If any write fails after the device was opened, the firmware may hold a half-written
 /// transaction, and the next `04 02` (from any job or live frame) could commit it. So every
 /// write is refused until the keyboard has been physically replugged.
-/// `vivid`: gamma-correct colours on the way to the keyboard (and undo it on the way back), so the
-/// UI always works with the colours as picked.
 fn spawn_worker(
     ctx: egui::Context,
     view: Arc<Mutex<LiveView>>,
     usb: Arc<Presence>,
-    vivid: Arc<AtomicBool>,
 ) -> (mpsc::Sender<Job>, mpsc::Receiver<Msg>) {
     let (jtx, jrx) = mpsc::channel::<Job>();
     let (mtx, mrx) = mpsc::channel();
@@ -150,8 +147,6 @@ fn spawn_worker(
                 }
                 continue;
             }
-            let out = |c: Rgb| if vivid.load(Relaxed) { effects::to_led(c) } else { c };
-            let back = |c: Rgb| if vivid.load(Relaxed) { effects::from_led(c) } else { c };
             if let Some(job) = job {
                 let res = match job {
                     Job::Live(cfg) => {
@@ -172,12 +167,8 @@ fn spawn_worker(
                         fx = None;
                         Ok("Live effect stopped")
                     }
-                    Job::Light(l) => {
-                        let l = Light { rgb: out(l.rgb), ..l };
-                        write(&mut kb, |k| k.set_light(&l)).map(|_| "Lighting applied")
-                    }
+                    Job::Light(l) => write(&mut kb, |k| k.set_light(&l)).map(|_| "Lighting applied"),
                     Job::PerKey(keys, br) => {
-                        let keys: Vec<_> = keys.into_iter().map(|(l, c)| (l, out(c))).collect();
                         write(&mut kb, |k| k.set_per_key(&keys, br)).map(|_| "Per-key colours applied")
                     }
                     Job::Clock => write(&mut kb, |k| k.sync_clock()).map(|_| "Clock synced"),
@@ -190,7 +181,7 @@ fn spawn_worker(
                     .map(|_| "Screen uploaded"),
                     Job::ReadKeys => device(&mut kb).and_then(|k| k.read_leds()).and_then(|c| {
                         let c = c.context("keyboard is busy, try again")?;
-                        send(Msg::Keys(leds.iter().map(|&l| back(c.get(l))).collect()));
+                        send(Msg::Keys(leds.iter().map(|&l| c.get(l)).collect()));
                         Ok("Loaded colours from the keyboard")
                     }),
                     Job::Mirror(_) => unreachable!("handled above"),
@@ -212,7 +203,7 @@ fn spawn_worker(
                 match device(&mut kb).and_then(|k| k.read_leds()) {
                     Ok(Some(c)) => {
                         mirror_misses = 0;
-                        view.lock().unwrap().mirror = leds.iter().map(|&l| back(c.get(l))).collect();
+                        view.lock().unwrap().mirror = leds.iter().map(|&l| c.get(l)).collect();
                     }
                     // Busy (e.g. right after an Apply): the driver just polls again; give up after ~1 s.
                     Ok(None) if mirror_misses < 10 => mirror_misses += 1,
@@ -236,13 +227,7 @@ fn spawn_worker(
             let Some(e) = fx.as_mut() else { continue };
             next = Instant::now() + FRAME;
             let colors = e.frame();
-            let frame = RtFrame::new(
-                &leds
-                    .iter()
-                    .copied()
-                    .zip(colors.iter().map(|&c| out(c)))
-                    .collect::<Vec<_>>(),
-            );
+            let frame = RtFrame::new(&leds.iter().copied().zip(colors.iter().copied()).collect::<Vec<_>>());
             let res = write(&mut kb, |k| k.stream(&frame));
             {
                 let mut v = view.lock().unwrap();
@@ -384,13 +369,15 @@ struct App {
     /// Lighting preview shows what the keyboard reports instead of a simulation.
     mirror_on: bool,
     mirror_sent: bool,
-    /// Shared with the worker: gamma-correct colours sent to the keyboard.
-    vivid: Arc<AtomicBool>,
     /// Status-bar icon (Linux with a tray host); with it, closing the window only hides it.
     tray: Option<tray::Tray>,
     tray_live: bool,
     hidden: bool,
     quitting: bool,
+    /// Mirroring paused after a failed read; cleared by the toggle or a replug. Not saved, so one
+    /// failure doesn't switch the user's choice off for good.
+    mirror_failed: bool,
+    last_present: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -404,10 +391,8 @@ impl App {
         style(&cc.egui_ctx);
         let view = Arc::new(Mutex::new(LiveView::default()));
         let usb = spawn_presence(cc.egui_ctx.clone());
-        let vivid = Arc::new(AtomicBool::new(true));
-        let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone(), vivid.clone());
+        let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone());
         let mut app = Self::with(jobs, msgs, usb, view);
-        app.vivid = vivid;
         let ctx = cc.egui_ctx.clone();
         app.tray = tray::spawn(Box::new(move || ctx.request_repaint()));
         app.audio_devices = effects::input_devices();
@@ -459,10 +444,11 @@ impl App {
             rest_min: 0,
             mirror_on: false,
             mirror_sent: false,
-            vivid: Default::default(),
             tray: None,
             tray_live: false,
             hidden: false,
+            mirror_failed: false,
+            last_present: false,
             quitting: false,
         };
         app.restore(Saved::default()); // single source of defaults
@@ -485,7 +471,6 @@ impl App {
             sensitivity: self.sensitivity,
             work_min: self.work_min,
             rest_min: self.rest_min,
-            vivid: self.vivid.load(Relaxed),
             mirror: self.mirror_on,
         }
     }
@@ -519,7 +504,6 @@ impl App {
         }
         self.work_min = s.work_min.clamp(*FOCUS_MIN.start(), *FOCUS_MIN.end());
         self.rest_min = s.rest_min.clamp(*BREAK_MIN.start(), *BREAK_MIN.end());
-        self.vivid.store(s.vivid, Relaxed);
         self.mirror_on = s.mirror;
     }
 
@@ -560,7 +544,9 @@ impl App {
                 ui.horizontal(|ui| {
                     label(ui, "Preview");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        toggle(ui, &mut self.mirror_on, "Mirror keyboard");
+                        if toggle(ui, &mut self.mirror_on, "Mirror keyboard") {
+                            self.mirror_failed = false;
+                        }
                         ui.add_space(12.0);
                         ui.label(if live {
                             RichText::new("● live from the keyboard").color(OK).size(12.0)
@@ -1237,7 +1223,9 @@ fn swatches(ui: &mut egui::Ui, value: &mut [u8; 3]) {
     });
 }
 
-fn toggle(ui: &mut egui::Ui, on: &mut bool, text: &str) {
+/// Returns whether the user flipped it this frame.
+fn toggle(ui: &mut egui::Ui, on: &mut bool, text: &str) -> bool {
+    let before = *on;
     ui.horizontal(|ui| {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(38.0, 22.0), Sense::click());
         if resp.clicked() {
@@ -1254,6 +1242,7 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool, text: &str) {
             *on = !*on;
         }
     });
+    *on != before
 }
 
 fn dot(ui: &mut egui::Ui, c: Color32) {
@@ -1388,7 +1377,6 @@ struct Saved {
     sensitivity: f32,
     work_min: u32,
     rest_min: u32,
-    vivid: bool,
     mirror: bool,
 }
 
@@ -1409,7 +1397,6 @@ impl Default for Saved {
             sensitivity: 1.2,
             work_min: 25,
             rest_min: 5,
-            vivid: false, // didn't visibly help on hardware; kept as an option
             mirror: true, // 04 F5 confirmed on hardware
         }
     }
@@ -1429,7 +1416,7 @@ impl eframe::App for App {
                 Msg::LiveStopped(e) => self.status = Err(e),
                 Msg::MirrorStopped(e) => {
                     self.status = Err(e);
-                    self.mirror_on = false; // don't immediately restart a mirror that just failed
+                    self.mirror_failed = true; // don't immediately restart a mirror that just failed
                 }
                 Msg::Keys(k) => self.keys = k,
                 Msg::Done(r) => {
@@ -1438,7 +1425,16 @@ impl eframe::App for App {
                 }
             }
         }
-        let want = !self.hidden && self.tab == Tab::Lighting && self.mirror_on && self.usb.present.load(Relaxed);
+        let present = self.usb.present.load(Relaxed);
+        if present && !self.last_present {
+            self.mirror_failed = false; // (re)plugged: worth trying again
+        }
+        self.last_present = present;
+        // A hidden/minimised window gets focus back when the user brings it up again.
+        if ctx.input(|i| i.focused) {
+            self.hidden = false;
+        }
+        let want = !self.hidden && !self.mirror_failed && self.tab == Tab::Lighting && self.mirror_on && present;
         if want != self.mirror_sent && self.jobs.send(Job::Mirror(want)).is_ok() {
             self.mirror_sent = want;
         }
@@ -1451,13 +1447,17 @@ impl eframe::App for App {
         for cmd in cmds {
             match cmd {
                 tray::TrayCmd::Show => {
-                    self.hidden = false;
+                    // On Wayland these are no-ops (winit can't show/raise/unminimise there);
+                    // the window is then brought back from the dock / Alt-Tab.
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                tray::TrayCmd::Music => self.run(Job::Live(self.live_cfg(LiveKind::Music))),
-                tray::TrayCmd::Pomodoro => self.run(Job::Live(self.live_cfg(LiveKind::Pomodoro))),
-                tray::TrayCmd::StopLive => self.run(Job::StopLive),
+                // Queued straight to the worker (which serialises everything) so a click from the
+                // tray isn't dropped while the window is busy with something else.
+                tray::TrayCmd::Music => drop(self.jobs.send(Job::Live(self.live_cfg(LiveKind::Music)))),
+                tray::TrayCmd::Pomodoro => drop(self.jobs.send(Job::Live(self.live_cfg(LiveKind::Pomodoro)))),
+                tray::TrayCmd::StopLive => drop(self.jobs.send(Job::StopLive)),
                 tray::TrayCmd::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1472,10 +1472,16 @@ impl eframe::App for App {
             self.tray_live = live;
         }
 
-        // With a tray icon, the window's close button hides it; live effects keep running.
+        // With a tray icon, the close button keeps the app (and live effects) running: it hides
+        // the window, or on Wayland, where windows can't be hidden, minimises it.
         if self.tray.is_some() && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            let wayland = cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some();
+            ctx.send_viewport_cmd(if wayland {
+                egui::ViewportCommand::Minimized(true)
+            } else {
+                egui::ViewportCommand::Visible(false)
+            });
             self.hidden = true;
         }
     }
@@ -1502,16 +1508,6 @@ impl eframe::App for App {
                         self.tab = t;
                     }
                 }
-                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-                    let mut v = self.vivid.load(Relaxed);
-                    toggle(ui, &mut v, "Vivid colours");
-                    self.vivid.store(v, Relaxed);
-                    ui.label(
-                        RichText::new("Gamma-corrects colours sent to the keyboard")
-                            .color(MUTED)
-                            .size(11.0),
-                    );
-                });
             });
 
         egui::Panel::bottom("bar")
