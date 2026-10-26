@@ -96,6 +96,10 @@ cargo clippy --all-targets
 | `src/effects.rs` | Live effects (spectrum analysis, Pomodoro) |
 | `src/layout.rs` | Key positions and LED indices, taken from the vendor layout file |
 
+## License
+
+[MIT](LICENSE)
+
 ## Not affiliated
 
 AULA and Epomaker are trademarks of their respective owners. This project is not affiliated with or endorsed by them, and it contains none of their software.

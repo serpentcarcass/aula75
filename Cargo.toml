@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Unofficial lighting, screen and live-effects control for the AULA F75 Max keyboard (macOS & Linux)"
 repository = "https://github.com/serpentcarcass/aula75"
+license = "MIT"
 publish = false
 
 [dependencies]
