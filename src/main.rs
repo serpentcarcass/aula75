@@ -2,6 +2,7 @@ mod cli;
 mod effects;
 mod layout;
 mod proto;
+mod screen;
 mod tray;
 mod vendor_tables;
 
@@ -11,13 +12,11 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense, Shadow, Stroke,
     Vec2,
 };
-use image::{AnimationDecoder, ImageFormat, codecs::gif::GifDecoder, imageops};
 use layout::KEYS;
 use proto::{Animation, Direction, Keyboard, LedIndex, Level, Light, Mode, RtFrame, Sent};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, mpsc};
 use std::{
-    io::Cursor,
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -362,6 +361,15 @@ struct App {
     frames: Vec<(Vec<u8>, u32)>,
     preview: Option<egui::TextureHandle>,
     screen_confirm: bool,
+    screen_mode: ScreenMode,
+    text: String,
+    text_size: f32,
+    text_fg: Rgb,
+    text_bg: Rgb,
+    text_scroll: bool,
+    pixels: Vec<Rgb>,
+    pixel_brush: Rgb,
+    preview_idx: usize,
     view: Arc<Mutex<LiveView>>,
     live_kind: LiveKind,
     vendor_fx: effects::VendorFx,
@@ -384,6 +392,15 @@ struct App {
     mirror_failed: bool,
     last_present: bool,
 }
+
+#[derive(PartialEq, Clone, Copy)]
+enum ScreenMode {
+    Image,
+    Text,
+    Pixel,
+}
+
+const PIXEL_SIDE: usize = 32;
 
 #[derive(PartialEq, Clone, Copy)]
 enum LiveKind {
@@ -441,6 +458,15 @@ impl App {
             frames: vec![],
             preview: None,
             screen_confirm: false,
+            screen_mode: ScreenMode::Image,
+            text: "AULA".into(),
+            text_size: 36.0,
+            text_fg: SWATCHES[1],
+            text_bg: [0; 3],
+            text_scroll: false,
+            pixels: vec![[0; 3]; PIXEL_SIDE * PIXEL_SIDE],
+            pixel_brush: SWATCHES[5],
+            preview_idx: 0,
             view,
             live_kind: LiveKind::Music,
             vendor_fx: effects::VendorFx::Spring,
@@ -711,7 +737,7 @@ impl App {
         header(
             ui,
             "Screen",
-            "128×128 TFT · PNG, JPG or animated GIF (up to 255 frames)",
+            "128×128 TFT · an image or GIF, rendered text, or pixel art (up to 255 frames)",
         );
         let (dropped, hovering) = ui.ctx().input(|i| {
             (
@@ -720,46 +746,57 @@ impl App {
             )
         });
         if let Some(p) = dropped {
+            self.screen_mode = ScreenMode::Image;
             self.screen_path = p.display().to_string();
             self.load_image(ui.ctx());
         }
 
         ui.columns(2, |c| {
             let ui = &mut c[0];
-            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 150.0), Sense::hover());
-            let border = if hovering { ACCENT } else { Color32::from_gray(70) };
-            ui.painter().rect(
-                rect,
-                14,
-                if hovering { ACCENT.gamma_multiply(0.08) } else { PANEL },
-                Stroke::new(1.5, border),
-                egui::StrokeKind::Inside,
-            );
-            draw_icon(ui.painter(), Icon::Drop, rect.center() - Vec2::new(0.0, 12.0), border);
-            ui.painter().text(
-                rect.center() + Vec2::new(0.0, 22.0),
-                Align2::CENTER_CENTER,
-                "Drop an image here",
-                FontId::proportional(14.0),
-                TEXT,
-            );
-            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.screen_path)
-                        .hint_text("or paste a path…")
-                        .desired_width(ui.available_width() - 70.0),
-                );
-                if ui.button("Load").clicked() {
-                    self.load_image(ui.ctx());
+                for (m, name) in [
+                    (ScreenMode::Image, "Image"),
+                    (ScreenMode::Text, "Text"),
+                    (ScreenMode::Pixel, "Pixel art"),
+                ] {
+                    if tile(ui, name, self.screen_mode == m, Vec2::new(110.0, 34.0)).clicked() {
+                        self.screen_mode = m;
+                    }
                 }
             });
+            ui.add_space(10.0);
+            match self.screen_mode {
+                ScreenMode::Image => self.screen_image(ui, hovering),
+                ScreenMode::Text => self.screen_text(ui),
+                ScreenMode::Pixel => self.screen_pixels(ui),
+            }
 
             let ui = &mut c[1];
             card(ui, "Preview", |ui| {
                 let size = Vec2::splat(192.0);
                 match &self.preview {
                     Some(tex) => {
+                        // Animate: pick the frame for the current time from the frame delays.
+                        let total: u64 = self.frames.iter().map(|f| f.1.max(30) as u64).sum();
+                        if self.frames.len() > 1 && total > 0 {
+                            let mut t = (ui.input(|i| i.time) * 1000.0) as u64 % total;
+                            let idx = self.frames.iter().position(|f| {
+                                let d = f.1.max(30) as u64;
+                                if t < d {
+                                    true
+                                } else {
+                                    t -= d;
+                                    false
+                                }
+                            });
+                            if let Some(idx) = idx.filter(|&i| i != self.preview_idx) {
+                                let img =
+                                    egui::ColorImage::from_rgba_unmultiplied([proto::SCREEN; 2], &self.frames[idx].0);
+                                tex.clone().set(img, egui::TextureOptions::NEAREST);
+                                self.preview_idx = idx;
+                            }
+                            ui.ctx().request_repaint_after(Duration::from_millis(30));
+                        }
                         ui.add(egui::Image::new(tex).fit_to_exact_size(size).corner_radius(10));
                         let n = self.frames.len();
                         ui.label(RichText::new(format!("{n} frame{}", if n == 1 { "" } else { "s" })).color(MUTED));
@@ -980,53 +1017,131 @@ impl App {
     }
 
     fn load_image(&mut self, ctx: &egui::Context) {
-        match load_frames(Path::new(self.screen_path.trim())) {
+        match screen::load_frames(Path::new(self.screen_path.trim())) {
             Ok(f) => {
-                let img = egui::ColorImage::from_rgba_unmultiplied([proto::SCREEN; 2], &f[0].0);
-                self.preview = Some(ctx.load_texture("screen", img, egui::TextureOptions::NEAREST));
-                self.frames = f;
-                self.screen_confirm = false;
+                self.set_frames(ctx, f);
                 self.status = Ok("Image loaded");
             }
             Err(e) => self.status = Err(format!("{e:#}")),
         }
     }
-}
 
-/// Decodes an image/GIF into 128×128 RGBA frames. Untrusted input: only regular files up to
-/// 32 MiB, decoder limits on canvas size and memory, frames resized one at a time.
-fn load_frames(path: &Path) -> Result<Vec<(Vec<u8>, u32)>> {
-    let meta = std::fs::metadata(path)?;
-    anyhow::ensure!(
-        meta.is_file() && meta.len() <= 32 << 20,
-        "not a regular file under 32 MiB"
-    );
-    let bytes = std::fs::read(path)?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
-    limits.max_alloc = Some(256 << 20);
-    let n = proto::SCREEN as u32;
-    let shrink = |f: image::Frame| {
-        let (num, den) = f.delay().numer_denom_ms();
-        let ms = num / den.max(1);
-        let px = imageops::resize(f.buffer(), n, n, imageops::FilterType::Triangle).into_raw();
-        (px, if ms <= 10 { 100 } else { ms }) // browsers treat 0–10 ms as 100 ms
-    };
-    let frames: Vec<_> = if image::guess_format(&bytes)? == ImageFormat::Gif {
-        let mut dec = GifDecoder::new(Cursor::new(&bytes))?;
-        image::ImageDecoder::set_limits(&mut dec, limits)?;
-        dec.into_frames()
-            .take(proto::MAX_FRAMES)
-            .map(|f| f.map(shrink))
-            .collect::<Result<_, _>>()?
-    } else {
-        let mut r = image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format()?;
-        r.limits(limits);
-        vec![shrink(image::Frame::new(r.decode()?.to_rgba8()))]
-    };
-    anyhow::ensure!(!frames.is_empty(), "image has no frames");
-    Ok(frames)
+    /// New frames for the preview and the upload; a new picture always needs a fresh confirm.
+    fn set_frames(&mut self, ctx: &egui::Context, f: Vec<screen::Frame>) {
+        let img = egui::ColorImage::from_rgba_unmultiplied([proto::SCREEN; 2], &f[0].0);
+        self.preview = Some(ctx.load_texture("screen", img, egui::TextureOptions::NEAREST));
+        self.preview_idx = 0;
+        self.frames = f;
+        self.screen_confirm = false;
+    }
+
+    fn screen_image(&mut self, ui: &mut egui::Ui, hovering: bool) {
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 150.0), Sense::hover());
+        let border = if hovering { ACCENT } else { Color32::from_gray(70) };
+        let fill = if hovering { ACCENT.gamma_multiply(0.08) } else { PANEL };
+        ui.painter()
+            .rect(rect, 14, fill, Stroke::new(1.5, border), egui::StrokeKind::Inside);
+        draw_icon(ui.painter(), Icon::Drop, rect.center() - Vec2::new(0.0, 12.0), border);
+        let at = rect.center() + Vec2::new(0.0, 22.0);
+        ui.painter().text(
+            at,
+            Align2::CENTER_CENTER,
+            "Drop an image here",
+            FontId::proportional(14.0),
+            TEXT,
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let path = egui::TextEdit::singleline(&mut self.screen_path).hint_text("or paste a path…");
+            ui.add(path.desired_width(ui.available_width() - 70.0));
+            if ui.button("Load").clicked() {
+                self.load_image(ui.ctx());
+            }
+        });
+    }
+
+    fn screen_text(&mut self, ui: &mut egui::Ui) {
+        card(ui, "Text", |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut self.text)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            label(ui, "Colour");
+            swatches(ui, &mut self.text_fg);
+            label(ui, "Background");
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(&mut self.text_bg);
+                if ui.button("Black").clicked() {
+                    self.text_bg = [0; 3];
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([86.0, 20.0], egui::Label::new("Size"));
+                ui.add(egui::Slider::new(&mut self.text_size, 12.0..=96.0).fixed_decimals(0));
+            });
+            toggle(ui, &mut self.text_scroll, "Scroll (marquee)");
+        });
+        if ui.button("Render").clicked() {
+            let f = screen::text_frames(&self.text, self.text_size, self.text_fg, self.text_bg, self.text_scroll);
+            self.set_frames(ui.ctx(), f);
+            self.status = Ok("Text rendered");
+        }
+    }
+
+    fn screen_pixels(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            swatches(ui, &mut self.pixel_brush);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Fill").clicked() {
+                self.pixels.fill(self.pixel_brush);
+            }
+            if ui.button("Clear").clicked() {
+                self.pixels.fill([0; 3]);
+            }
+            ui.label(
+                RichText::new("Drag to paint · right-click picks")
+                    .color(MUTED)
+                    .size(12.0),
+            );
+        });
+        let side = ui.available_width().min(320.0);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(side), Sense::click_and_drag());
+        let cell = side / PIXEL_SIDE as f32;
+        let mut changed = false;
+        if let Some(p) = resp.interact_pointer_pos().filter(|p| rect.contains(*p)) {
+            let (x, y) = (
+                ((p.x - rect.left()) / cell) as usize,
+                ((p.y - rect.top()) / cell) as usize,
+            );
+            let i = y.min(PIXEL_SIDE - 1) * PIXEL_SIDE + x.min(PIXEL_SIDE - 1);
+            if resp.secondary_clicked() {
+                self.pixel_brush = self.pixels[i];
+            } else if (resp.dragged_by(egui::PointerButton::Primary) || resp.clicked())
+                && self.pixels[i] != self.pixel_brush
+            {
+                self.pixels[i] = self.pixel_brush;
+                changed = true;
+            }
+        }
+        let painter = ui.painter_at(rect);
+        for (i, &c) in self.pixels.iter().enumerate() {
+            let min = rect.min + Vec2::new((i % PIXEL_SIDE) as f32, (i / PIXEL_SIDE) as f32) * cell;
+            painter.rect_filled(Rect::from_min_size(min, Vec2::splat(cell)), 0, rgb(c));
+        }
+        painter.rect_stroke(
+            rect,
+            4,
+            Stroke::new(1.0, Color32::from_gray(60)),
+            egui::StrokeKind::Outside,
+        );
+        if changed || self.frames.is_empty() || ui.button("Use as screen image").clicked() {
+            let f = vec![screen::pixel_frame(&self.pixels, PIXEL_SIDE)];
+            self.set_frames(ui.ctx(), f);
+        }
+    }
 }
 
 fn local_now() -> (String, String) {

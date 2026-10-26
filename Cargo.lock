@@ -476,9 +476,11 @@ dependencies = [
 name = "aula-control"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "cpal",
  "eframe",
+ "epaint_default_fonts",
  "hidapi",
  "image",
  "ksni",

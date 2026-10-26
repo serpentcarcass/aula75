@@ -68,7 +68,7 @@ fn dispatch(args: &[String]) -> Result<()> {
                 yes == "--yes",
                 "screen replaces the animation stored on the keyboard; add --yes"
             );
-            let frames = crate::load_frames(std::path::Path::new(path))?;
+            let frames = crate::screen::load_frames(std::path::Path::new(path))?;
             let anim = Animation::from_rgba(&frames)?;
             ensure!(!STOP.load(SeqCst), "cancelled"); // decoding can take a while
             // Progress must never panic mid-upload (e.g. stderr is a closed pipe).

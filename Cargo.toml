@@ -9,9 +9,11 @@ license = "MIT"
 publish = false
 
 [dependencies]
+ab_glyph = "0.2.32"
 anyhow = "1.0.104"
 cpal = "0.18.2"
 eframe = { version = "0.37.0", features = ["persistence"] }
+epaint_default_fonts = "0.37.0"
 hidapi = "2.6.7"
 image = { version = "0.25.10", default-features = false, features = ["gif", "png", "jpeg"] }
 libc = "0.2.191"
