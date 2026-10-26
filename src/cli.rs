@@ -17,7 +17,7 @@ const USAGE: &str = "\
 usage: aula-control [command]          (no command: open the window)
 
   modes                                list lighting effects
-  light <effect> [color=RRGGBB] [brightness=0-5] [speed=0-5] [dir=left|right|up|down] [rainbow]
+  light <effect> [color=RRGGBB] [brightness=0-5] [speed=0-5] [dir=left|right|up|down] [rainbow] [raw]
   clock                                set the screen clock to local time
   screen <image> --yes                 upload a PNG/JPG/GIF to the screen (replaces the stored one)
   live music [device=NAME] [sensitivity=0.5-3]
@@ -149,10 +149,13 @@ fn parse_light(effect: &str, opts: &[String]) -> Result<Light> {
         .find(|m| norm(m.name()) == norm(effect))
         .with_context(|| format!("unknown effect `{effect}` (see `modes`)"))?;
     let mut rainbow = false;
+    let mut raw = false;
     let mut pairs = vec![];
     for o in opts {
         if o == "rainbow" {
             rainbow = true;
+        } else if o == "raw" {
+            raw = true;
         } else {
             pairs.push(o.clone());
         }
@@ -176,7 +179,8 @@ fn parse_light(effect: &str, opts: &[String]) -> Result<Light> {
     let dir_default = Direction::ALL[d.direction as usize];
     Ok(Light {
         mode,
-        rgb: opt(&opts, "color", d.rgb, parse_hex)?,
+        // Same gamma correction as the GUI's "Vivid colours" unless `raw`.
+        rgb: opt(&opts, "color", d.rgb, parse_hex).map(|c| if raw { c } else { effects::to_led(c) })?,
         rainbow,
         brightness: Level::new(opt(&opts, "brightness", d.brightness, |v| parse_in(v, 0..=Level::MAX))?),
         speed: Level::new(opt(&opts, "speed", d.speed, |v| parse_in(v, 0..=Level::MAX))?),
@@ -250,7 +254,7 @@ mod tests {
         let l = parse_light("rolling", &args("color=#00ff80 brightness=2 dir=left rainbow")).unwrap();
         assert_eq!(
             (l.mode.name(), l.rgb, l.brightness.get(), l.direction, l.rainbow),
-            ("Rolling", [0, 255, 128], 2, Direction::Left, true)
+            ("Rolling", effects::to_led([0, 255, 128]), 2, Direction::Left, true)
         );
         assert!(
             parse_light("single-on", &args("dir=up")).is_err(),
@@ -277,7 +281,7 @@ mod tests {
         );
         assert!(parse_light("static", &args("speed=2")).is_err(), "Static has no speed");
         assert_eq!(
-            parse_light("static", &[]).unwrap().rgb,
+            parse_light("static", &args("raw")).unwrap().rgb,
             Saved::default().rgb,
             "same defaults as the GUI"
         );

@@ -31,6 +31,17 @@ fn hsv(h: f32, s: f32, v: f32) -> Rgb {
     eframe::egui::ecolor::rgb_from_hsv((h, s, v)).map(|c| (c * 255.0) as u8)
 }
 
+/// LEDs are linear but eyes aren't, so mid values look washed out (orange turns pale yellow,
+/// pastels go white). Gamma 2.2 before sending restores saturation; `from_led` undoes it for
+/// colours read back from the keyboard.
+pub fn to_led(c: Rgb) -> Rgb {
+    c.map(|x| ((x as f32 / 255.0).powf(2.2) * 255.0).round() as u8)
+}
+
+pub fn from_led(c: Rgb) -> Rgb {
+    c.map(|x| ((x as f32 / 255.0).powf(1.0 / 2.2) * 255.0).round() as u8)
+}
+
 fn scale([r, g, b]: Rgb, k: f32) -> Rgb {
     let k = k.clamp(0.0, 1.0);
     [(r as f32 * k) as u8, (g as f32 * k) as u8, (b as f32 * k) as u8]
@@ -333,6 +344,14 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+        }
+    }
+
+    #[test]
+    fn gamma() {
+        assert_eq!(to_led([255, 128, 0]), [255, 56, 0], "orange keeps its orange");
+        for x in [64u8, 128, 200, 255] {
+            assert!(from_led(to_led([x; 3]))[0].abs_diff(x) <= 3, "round trip for {x}");
         }
     }
 

@@ -94,10 +94,13 @@ const MIRROR_EVERY: Duration = Duration::from_millis(100);
 /// If any write fails after the device was opened, the firmware may hold a half-written
 /// transaction, and the next `04 02` (from any job or live frame) could commit it. So every
 /// write is refused until the keyboard has been physically replugged.
+/// `vivid`: gamma-correct colours on the way to the keyboard (and undo it on the way back), so the
+/// UI always works with the colours as picked.
 fn spawn_worker(
     ctx: egui::Context,
     view: Arc<Mutex<LiveView>>,
     usb: Arc<Presence>,
+    vivid: Arc<AtomicBool>,
 ) -> (mpsc::Sender<Job>, mpsc::Receiver<Msg>) {
     let (jtx, jrx) = mpsc::channel::<Job>();
     let (mtx, mrx) = mpsc::channel();
@@ -146,6 +149,8 @@ fn spawn_worker(
                 }
                 continue;
             }
+            let out = |c: Rgb| if vivid.load(Relaxed) { effects::to_led(c) } else { c };
+            let back = |c: Rgb| if vivid.load(Relaxed) { effects::from_led(c) } else { c };
             if let Some(job) = job {
                 let res = match job {
                     Job::Live(cfg) => {
@@ -166,8 +171,12 @@ fn spawn_worker(
                         fx = None;
                         Ok("Live effect stopped")
                     }
-                    Job::Light(l) => write(&mut kb, |k| k.set_light(&l)).map(|_| "Lighting applied"),
+                    Job::Light(l) => {
+                        let l = Light { rgb: out(l.rgb), ..l };
+                        write(&mut kb, |k| k.set_light(&l)).map(|_| "Lighting applied")
+                    }
                     Job::PerKey(keys, br) => {
+                        let keys: Vec<_> = keys.into_iter().map(|(l, c)| (l, out(c))).collect();
                         write(&mut kb, |k| k.set_per_key(&keys, br)).map(|_| "Per-key colours applied")
                     }
                     Job::Clock => write(&mut kb, |k| k.sync_clock()).map(|_| "Clock synced"),
@@ -180,7 +189,7 @@ fn spawn_worker(
                     .map(|_| "Screen uploaded"),
                     Job::ReadKeys => device(&mut kb).and_then(|k| k.read_leds()).and_then(|c| {
                         let c = c.context("keyboard is busy, try again")?;
-                        send(Msg::Keys(leds.iter().map(|&l| c.get(l)).collect()));
+                        send(Msg::Keys(leds.iter().map(|&l| back(c.get(l))).collect()));
                         Ok("Loaded colours from the keyboard")
                     }),
                     Job::Mirror(_) => unreachable!("handled above"),
@@ -202,7 +211,7 @@ fn spawn_worker(
                 match device(&mut kb).and_then(|k| k.read_leds()) {
                     Ok(Some(c)) => {
                         mirror_misses = 0;
-                        view.lock().unwrap().mirror = leds.iter().map(|&l| c.get(l)).collect();
+                        view.lock().unwrap().mirror = leds.iter().map(|&l| back(c.get(l))).collect();
                     }
                     // Busy (e.g. right after an Apply): the driver just polls again; give up after ~1 s.
                     Ok(None) if mirror_misses < 10 => mirror_misses += 1,
@@ -226,7 +235,13 @@ fn spawn_worker(
             let Some(e) = fx.as_mut() else { continue };
             next = Instant::now() + FRAME;
             let colors = e.frame();
-            let frame = RtFrame::new(&leds.iter().copied().zip(colors.iter().copied()).collect::<Vec<_>>());
+            let frame = RtFrame::new(
+                &leds
+                    .iter()
+                    .copied()
+                    .zip(colors.iter().map(|&c| out(c)))
+                    .collect::<Vec<_>>(),
+            );
             let res = write(&mut kb, |k| k.stream(&frame));
             {
                 let mut v = view.lock().unwrap();
@@ -368,6 +383,8 @@ struct App {
     /// Lighting preview shows what the keyboard reports instead of a simulation.
     mirror_on: bool,
     mirror_sent: bool,
+    /// Shared with the worker: gamma-correct colours sent to the keyboard.
+    vivid: Arc<AtomicBool>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -381,8 +398,10 @@ impl App {
         style(&cc.egui_ctx);
         let view = Arc::new(Mutex::new(LiveView::default()));
         let usb = spawn_presence(cc.egui_ctx.clone());
-        let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone());
+        let vivid = Arc::new(AtomicBool::new(true));
+        let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone(), vivid.clone());
         let mut app = Self::with(jobs, msgs, usb, view);
+        app.vivid = vivid;
         app.audio_devices = effects::input_devices();
         if let Some(s) = cc
             .storage
@@ -432,6 +451,7 @@ impl App {
             rest_min: 0,
             mirror_on: false, // opt-in until `04 F5` has been confirmed on hardware
             mirror_sent: false,
+            vivid: Default::default(),
         };
         app.restore(Saved::default()); // single source of defaults
         app
@@ -453,6 +473,7 @@ impl App {
             sensitivity: self.sensitivity,
             work_min: self.work_min,
             rest_min: self.rest_min,
+            vivid: self.vivid.load(Relaxed),
         }
     }
 
@@ -485,6 +506,7 @@ impl App {
         }
         self.work_min = s.work_min.clamp(*FOCUS_MIN.start(), *FOCUS_MIN.end());
         self.rest_min = s.rest_min.clamp(*BREAK_MIN.start(), *BREAK_MIN.end());
+        self.vivid.store(s.vivid, Relaxed);
     }
 
     fn run(&mut self, job: Job) {
@@ -1348,6 +1370,7 @@ struct Saved {
     sensitivity: f32,
     work_min: u32,
     rest_min: u32,
+    vivid: bool,
 }
 
 impl Default for Saved {
@@ -1367,6 +1390,7 @@ impl Default for Saved {
             sensitivity: 1.2,
             work_min: 25,
             rest_min: 5,
+            vivid: true,
         }
     }
 }
@@ -1418,6 +1442,16 @@ impl eframe::App for App {
                         self.tab = t;
                     }
                 }
+                ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    let mut v = self.vivid.load(Relaxed);
+                    toggle(ui, &mut v, "Vivid colours");
+                    self.vivid.store(v, Relaxed);
+                    ui.label(
+                        RichText::new("Gamma-corrects colours sent to the keyboard")
+                            .color(MUTED)
+                            .size(11.0),
+                    );
+                });
             });
 
         egui::Panel::bottom("bar")
