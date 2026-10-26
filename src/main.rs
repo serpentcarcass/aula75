@@ -650,7 +650,21 @@ impl App {
                 if m.has_color() || m.has_rainbow() {
                     label(ui, "Colour");
                     ui.add_enabled_ui(!(l.rainbow && m.has_rainbow()) && m.has_color(), |ui| {
-                        swatches(ui, &mut l.rgb)
+                        swatches(ui, &mut l.rgb);
+                        // Exact primaries, for checking what the LEDs really show.
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Pure").color(MUTED).size(12.0));
+                            for (name, c) in [
+                                ("R", [255, 0, 0]),
+                                ("G", [0, 255, 0]),
+                                ("B", [0, 0, 255]),
+                                ("W", [255; 3]),
+                            ] {
+                                if ui.selectable_label(l.rgb == c, name).clicked() {
+                                    l.rgb = c;
+                                }
+                            }
+                        });
                     });
                     if m.has_rainbow() {
                         ui.add_space(4.0);
