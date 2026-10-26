@@ -13,13 +13,19 @@ jobs:
   # Read-only: builds, lints and tests every push; on v* tags also packages the binary.
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: System libraries
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
+          # man-db's trigger can rebuild its index for many minutes on these runners; skip it.
+          sudo rm -f /var/lib/man-db/auto-update
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang libclang-dev libudev-dev libpipewire-0.3-dev libspa-0.2-dev \
@@ -58,6 +64,7 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
