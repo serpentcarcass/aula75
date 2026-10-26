@@ -18,7 +18,7 @@ use crate::layout::KEYS;
 use anyhow::{Context, Result, bail, ensure};
 use hidapi::{HidApi, HidDevice};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -300,6 +300,7 @@ pub struct Keyboard {
     bulk: Option<HidDevice>,
     /// Identifies this plug-in of the board; changes when it is replugged.
     instance: String,
+    dir: PathBuf,
     _lock: File,
 }
 
@@ -307,19 +308,59 @@ pub const INTERRUPTED: &str =
     "A previous write was interrupted. Unplug the keyboard for a few seconds and plug it back in.";
 
 /// Per-user runtime directory for the process lock and the interrupted-write marker.
-fn runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+///
+/// Derived from the uid, not environment variables, so a window and a command (or an ssh
+/// session) always agree. Root is refused: `sudo` would silently use a different directory.
+fn runtime_dir() -> Result<PathBuf> {
+    // SAFETY: geteuid/getuid cannot fail.
+    ensure!(
+        unsafe { libc::geteuid() } != 0,
+        "don't run aula-control as root (on Linux, install the udev rule instead)"
+    );
+    #[cfg(target_os = "linux")]
+    let dir = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
+    #[cfg(target_os = "macos")]
+    let dir = {
+        let mut buf = [0 as libc::c_char; 1024];
+        // SAFETY: the buffer and its length match; confstr NUL-terminates within it.
+        let n = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+        ensure!(n > 0 && n <= buf.len(), "cannot find the per-user temp directory");
+        // SAFETY: confstr wrote a NUL-terminated string into buf.
+        PathBuf::from(
+            unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    };
+    ensure!(dir.is_dir(), "runtime directory {} is missing", dir.display());
+    Ok(dir)
+}
+
+const MARKER: &str = "aula75.interrupted";
+
+/// Atomically records `instance` as "write in progress" (temp file + rename, no symlinks).
+fn set_marker(dir: &Path, instance: &str) -> Result<()> {
+    let tmp = dir.join(format!("{MARKER}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    f.write_all(instance.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, dir.join(MARKER))?;
+    Ok(())
 }
 
 /// Opens `path` without following a symlink (the fallback dir may be a shared /tmp).
-fn open_private(path: &Path, truncate: bool) -> std::io::Result<File> {
+fn open_private(path: &Path) -> std::io::Result<File> {
     OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        .truncate(truncate)
+        .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
@@ -327,7 +368,7 @@ fn open_private(path: &Path, truncate: bool) -> std::io::Result<File> {
 
 /// Only one process (GUI window or CLI command) may hold the keyboard at a time.
 fn take_lock(dir: &Path) -> Result<File> {
-    let f = open_private(&dir.join("aula75.lock"), false)?;
+    let f = open_private(&dir.join("aula75.lock"))?;
     // SAFETY: flock on a file descriptor we own.
     let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     ensure!(
@@ -337,15 +378,24 @@ fn take_lock(dir: &Path) -> Result<File> {
     Ok(f)
 }
 
-/// Refuses while an interrupted-write marker names this same plug-in of the board;
-/// a marker for an older plug-in means it has been replugged since, so it's cleared.
+/// Refuses while the marker names this same plug-in of the board; a marker for an older plug-in
+/// means it has been replugged since, so it's cleared. Only "no marker" passes: any other error
+/// (unreadable, symlink, ...) refuses, failing safe.
 fn check_interrupted(dir: &Path, instance: &str) -> Result<()> {
-    let marker = dir.join("aula75.interrupted");
-    match std::fs::read_to_string(&marker) {
-        Ok(s) if s == instance => bail!(INTERRUPTED),
-        Ok(_) => Ok(std::fs::remove_file(&marker)?),
-        Err(_) => Ok(()),
-    }
+    let marker = dir.join(MARKER);
+    let mut s = String::new();
+    match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&marker)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => bail!("cannot check {}: {e}; refusing to touch the keyboard", marker.display()),
+        Ok(mut f) => f.read_to_string(&mut s)?,
+    };
+    ensure!(s != instance, "{INTERRUPTED} (marker: {})", marker.display());
+    std::fs::remove_file(&marker)?;
+    Ok(())
 }
 
 /// A string that changes whenever the board re-enumerates: on macOS hidapi's path carries the
@@ -378,7 +428,7 @@ impl Keyboard {
         if !KNOWN_FIRMWARE.contains(&fw) {
             bail!("firmware {fw:#06x} not verified with this tool, refusing to write");
         }
-        let dir = runtime_dir();
+        let dir = runtime_dir()?;
         let lock = take_lock(&dir)?;
         let instance = instance_id(info);
         check_interrupted(&dir, &instance)?;
@@ -390,6 +440,7 @@ impl Keyboard {
             cmd,
             bulk,
             instance,
+            dir,
             _lock: lock,
         })
     }
@@ -397,11 +448,18 @@ impl Keyboard {
     /// Call after a write failed mid-transaction: every process refuses this board until it is
     /// replugged, so a later `04 02` can't commit the half-written state.
     pub fn mark_interrupted(&self) {
-        let written = open_private(&runtime_dir().join("aula75.interrupted"), true)
-            .and_then(|mut f| f.write_all(self.instance.as_bytes()));
-        if let Err(e) = written {
-            eprintln!("aula75: could not record the interrupted write: {e}");
+        if let Err(e) = set_marker(&self.dir, &self.instance) {
+            eprintln!("aula75: could not record the interrupted write: {e:#}");
         }
+    }
+
+    /// Write-ahead guard for stored writes: the marker exists for the whole transaction, so a
+    /// failure, panic, kill or closed window all leave it behind, and every process refuses
+    /// this board until it is replugged. Without a marker on disk, nothing is written.
+    fn guarded(&self, op: impl FnOnce() -> Result<()>) -> Result<()> {
+        set_marker(&self.dir, &self.instance).context("cannot record the write in progress; refusing to write")?;
+        op()?;
+        std::fs::remove_file(self.dir.join(MARKER)).context("write applied, but its safety marker could not be cleared")
     }
 
     fn send(&self, p: &[u8; 64]) -> Result<()> {
@@ -522,72 +580,79 @@ impl Keyboard {
     }
 
     pub fn set_light(&self, l: &Light) -> Result<()> {
-        self.write_light(&light_packet(l))
+        self.guarded(|| self.write_light(&light_packet(l)))
     }
 
     pub fn set_per_key(&self, keys: &[(LedIndex, [u8; 3])], brightness: Level) -> Result<()> {
-        self.write_light(&light_raw(
-            CUSTOM_MODE_ID,
-            [0; 3],
-            false,
-            brightness,
-            Level(0),
-            Direction::Left,
-        ))?;
-        self.command(Cmd::Begin, 0)?;
-        self.command(Cmd::PerKey, 9)?;
-        self.data(&per_key_packet(keys))?;
-        self.command(Cmd::Apply, 0)?;
-        self.send(&Cmd::Finish.packet(0))
+        self.guarded(|| {
+            self.write_light(&light_raw(
+                CUSTOM_MODE_ID,
+                [0; 3],
+                false,
+                brightness,
+                Level(0),
+                Direction::Left,
+            ))?;
+            self.command(Cmd::Begin, 0)?;
+            self.command(Cmd::PerKey, 9)?;
+            self.data(&per_key_packet(keys))?;
+            self.command(Cmd::Apply, 0)?;
+            self.send(&Cmd::Finish.packet(0))
+        })
     }
 
     /// Clock on the TFT, from the local time of this machine.
     pub fn sync_clock(&self) -> Result<()> {
-        let t = local_time()?;
-        let mut p = [0; 64];
-        p[1] = 1;
-        p[2] = 0x5a;
-        p[3] = (t.tm_year % 100) as u8;
-        p[4] = (t.tm_mon + 1) as u8;
-        p[5] = t.tm_mday as u8;
-        p[6] = t.tm_hour as u8;
-        p[7] = t.tm_min as u8;
-        p[8] = t.tm_sec.min(59) as u8;
-        p[10] = t.tm_wday as u8;
-        magic(&mut p);
-        self.command(Cmd::Begin, 0)?;
-        self.command(Cmd::Clock, 1)?;
-        self.send(&p)?;
-        // The driver reads back after the clock data packet too (FUN_004238f0); the reply
-        // has no `04 xx` header, so only its length is checked.
-        self.reply(Cmd::Clock)?;
-        self.command(Cmd::Apply, 0)
+        self.guarded(|| {
+            let t = local_time()?;
+            let mut p = [0; 64];
+            p[1] = 1;
+            p[2] = 0x5a;
+            p[3] = (t.tm_year % 100) as u8;
+            p[4] = (t.tm_mon + 1) as u8;
+            p[5] = t.tm_mday as u8;
+            p[6] = t.tm_hour as u8;
+            p[7] = t.tm_min as u8;
+            p[8] = t.tm_sec.min(59) as u8;
+            p[10] = t.tm_wday as u8;
+            magic(&mut p);
+            self.command(Cmd::Begin, 0)?;
+            self.command(Cmd::Clock, 1)?;
+            self.send(&p)?;
+            // The driver reads back after the clock data packet too (FUN_004238f0); the reply
+            // has no `04 xx` header, so only its length is checked.
+            self.reply(Cmd::Clock)?;
+            self.command(Cmd::Apply, 0)
+        })
     }
 
     /// Upload to the single screen slot (`gif_count="1"`). `progress` gets 0..=100.
     pub fn upload_screen(&self, a: &Animation, mut progress: impl FnMut(u32)) -> Result<()> {
+        // Checked before the guard: refusing here sends nothing, so it must not leave a marker.
         let Some(bulk) = &self.bulk else {
             bail!("screen interface (0xFF68) not available")
         };
-        let blob = screen_blob(a);
-        let pages = (blob.len() / PAGE) as u16;
-        let mut p = Cmd::Screen.packet(0);
-        p[2] = 1;
-        p[8..10].copy_from_slice(&pages.to_le_bytes());
-        self.command(Cmd::Begin, 0)?;
-        self.step(Cmd::Screen, &p)?;
-        let mut buf = vec![0u8; PAGE + 1];
-        for (i, page) in blob.chunks(PAGE).enumerate() {
-            buf[0] = 0;
-            buf[1..].copy_from_slice(page);
-            let n = bulk.write(&buf)?;
-            ensure!(n == buf.len(), "screen page {i}: short write ({n})");
-            // The driver waits up to 300 ms for an ack and ignores its content and a timeout
-            // (FUN_0044f2b0); an I/O error, however, aborts before Apply.
-            bulk.read_timeout(&mut buf, 300)?;
-            progress((i as u32 + 1) * 100 / pages as u32);
-        }
-        self.command(Cmd::Apply, 0)
+        self.guarded(|| {
+            let blob = screen_blob(a);
+            let pages = (blob.len() / PAGE) as u16;
+            let mut p = Cmd::Screen.packet(0);
+            p[2] = 1;
+            p[8..10].copy_from_slice(&pages.to_le_bytes());
+            self.command(Cmd::Begin, 0)?;
+            self.step(Cmd::Screen, &p)?;
+            let mut buf = vec![0u8; PAGE + 1];
+            for (i, page) in blob.chunks(PAGE).enumerate() {
+                buf[0] = 0;
+                buf[1..].copy_from_slice(page);
+                let n = bulk.write(&buf)?;
+                ensure!(n == buf.len(), "screen page {i}: short write ({n})");
+                // The driver waits up to 300 ms for an ack and ignores its content and a timeout
+                // (FUN_0044f2b0); an I/O error, however, aborts before Apply.
+                bulk.read_timeout(&mut buf, 300)?;
+                progress((i as u32 + 1) * 100 / pages as u32);
+            }
+            self.command(Cmd::Apply, 0)
+        })
     }
 }
 
@@ -606,20 +671,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packets() {
-        // Cross-process guards, in a private temp dir.
+    fn process_lock_and_write_ahead_marker() {
         let dir = std::env::temp_dir().join(format!("aula75-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let held = take_lock(&dir).unwrap();
         assert!(take_lock(&dir).is_err(), "second holder must be refused");
         drop(held);
         assert!(take_lock(&dir).is_ok());
-        std::fs::write(dir.join("aula75.interrupted"), "plug-1").unwrap();
+
+        assert!(check_interrupted(&dir, "plug-1").is_ok(), "no marker passes");
+        set_marker(&dir, "plug-1").unwrap();
         assert!(check_interrupted(&dir, "plug-1").is_err(), "same plug-in stays locked");
         assert!(check_interrupted(&dir, "plug-2").is_ok(), "replug clears it");
-        assert!(!dir.join("aula75.interrupted").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!dir.join(MARKER).exists());
 
+        // Anything but "not found" fails safe.
+        std::os::unix::fs::symlink("/etc/hosts", dir.join(MARKER)).unwrap();
+        assert!(check_interrupted(&dir, "plug-1").is_err(), "symlinked marker refuses");
+        std::fs::remove_file(dir.join(MARKER)).unwrap();
+        std::fs::create_dir(dir.join(MARKER)).unwrap();
+        assert!(check_interrupted(&dir, "plug-1").is_err(), "unreadable marker refuses");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn packets() {
         let mode = Mode::all().find(|m| m.name() == "Static").unwrap();
         let l = Light {
             mode,

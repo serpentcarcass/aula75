@@ -181,10 +181,7 @@ fn spawn_worker(
                     Job::Mirror(_) => unreachable!("handled above"),
                 };
                 if res.as_ref().is_err_and(|e| e.is::<WriteFailed>()) {
-                    // Every process now refuses this board until it is replugged (Keyboard::open).
-                    if let Some(k) = &kb {
-                        k.mark_interrupted();
-                    }
+                    // The write left its write-ahead marker: every process refuses this board until replug.
                     fx = None;
                     kb = None;
                     view.lock().unwrap().mirror.clear(); // no stale "live" preview while locked

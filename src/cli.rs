@@ -7,7 +7,9 @@
 use crate::effects::{self, Effect};
 use crate::layout::KEYS;
 use crate::proto::{Animation, Direction, Keyboard, LedIndex, Level, Light, Mode, RtFrame, Sent};
+use crate::{BREAK_MIN, FOCUS_MIN, SENSITIVITY, Saved};
 use anyhow::{Context, Result, bail, ensure};
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
@@ -52,7 +54,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             Ok(())
         }
         "clock" => {
-            no_extra(rest)?;
+            ensure!(rest.is_empty(), "clock takes no arguments");
             write(|k| k.sync_clock())?;
             println!("clock synced");
             Ok(())
@@ -67,30 +69,34 @@ fn dispatch(args: &[String]) -> Result<()> {
             );
             let frames = crate::load_frames(std::path::Path::new(path))?;
             let anim = Animation::from_rgba(&frames)?;
-            write(|k| k.upload_screen(&anim, |p| eprint!("\ruploading {p:3}%")))?;
-            eprintln!();
+            ensure!(!STOP.load(SeqCst), "cancelled"); // decoding can take a while
+            // Progress must never panic mid-upload (e.g. stderr is a closed pipe).
+            write(|k| k.upload_screen(&anim, |p| drop(write!(std::io::stderr(), "\ruploading {p:3}%"))))?;
+            let _ = writeln!(std::io::stderr());
             println!("screen uploaded ({} frames)", frames.len());
             Ok(())
         }
         "live" => {
             let (kind, opts) = rest.split_first().context("live: music or pomodoro?")?;
             let opts = kv(opts)?;
-            let mut fx: Box<dyn Effect> = match kind.as_str() {
+            let d = Saved::default();
+            // Built only after the keyboard is ours, so a busy keyboard never starts audio capture.
+            let make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>> = match kind.as_str() {
                 "music" => {
-                    let sens = opt(&opts, "sensitivity", 1.2, |v| parse_in(v, 0.5..=3.0))?;
-                    let device = opts.iter().find(|(k, _)| k == "device").map(|(_, v)| v.as_str());
                     known(&opts, &["sensitivity", "device"])?;
-                    Box::new(effects::Music::new(device, sens)?)
+                    let sens = opt(&opts, "sensitivity", d.sensitivity, |v| parse_in(v, SENSITIVITY))?;
+                    let device = opts.iter().find(|(k, _)| k == "device").map(|(_, v)| v.clone());
+                    Box::new(move || Ok(Box::new(effects::Music::new(device.as_deref(), sens)?) as _))
                 }
                 "pomodoro" => {
-                    let focus = opt(&opts, "focus", 25, |v| parse_in(v, 5..=90))?;
-                    let rest = opt(&opts, "break", 5, |v| parse_in(v, 1..=30))?;
                     known(&opts, &["focus", "break"])?;
-                    Box::new(effects::Pomodoro::new(focus, rest))
+                    let focus = opt(&opts, "focus", d.work_min, |v| parse_in(v, FOCUS_MIN))?;
+                    let rest = opt(&opts, "break", d.rest_min, |v| parse_in(v, BREAK_MIN))?;
+                    Box::new(move || Ok(Box::new(effects::Pomodoro::new(focus, rest)) as _))
                 }
                 other => bail!("live: unknown effect `{other}` (music or pomodoro)"),
             };
-            stream(fx.as_mut())
+            stream(make)
         }
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
@@ -100,18 +106,18 @@ fn dispatch(args: &[String]) -> Result<()> {
     }
 }
 
-/// Opens the keyboard, runs one write; on failure marks the board interrupted (until replug).
+/// Opens the keyboard and runs one stored write (which guards itself with the write-ahead marker).
 fn write(op: impl FnOnce(&Keyboard) -> Result<()>) -> Result<()> {
-    let k = Keyboard::open()?;
-    op(&k).inspect_err(|_| k.mark_interrupted())
+    op(&Keyboard::open()?)
 }
 
 /// Streams a live effect at ~30 fps until Ctrl-C, mirroring the GUI worker's rules.
-fn stream(fx: &mut dyn Effect) -> Result<()> {
+fn stream(make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>>) -> Result<()> {
     let k = Keyboard::open()?;
+    let mut fx = make()?;
     let leds: Vec<LedIndex> = (0..KEYS.len()).filter_map(LedIndex::of_key).collect();
     let mut busy = 0;
-    eprintln!("streaming, Ctrl-C to stop");
+    let _ = writeln!(std::io::stderr(), "streaming, Ctrl-C to stop");
     while !STOP.load(SeqCst) {
         let next = Instant::now() + Duration::from_millis(33);
         let colors = fx.frame();
@@ -129,11 +135,11 @@ fn stream(fx: &mut dyn Effect) -> Result<()> {
         }
         let label = fx.label();
         if !label.is_empty() {
-            eprint!("\r{label}   ");
+            let _ = write!(std::io::stderr(), "\r{label}   ");
         }
         std::thread::sleep(next.saturating_duration_since(Instant::now()));
     }
-    eprintln!("\nstopped");
+    let _ = writeln!(std::io::stderr(), "\nstopped");
     Ok(())
 }
 
@@ -153,13 +159,28 @@ fn parse_light(effect: &str, opts: &[String]) -> Result<Light> {
     }
     let opts = kv(&pairs)?;
     known(&opts, &["color", "brightness", "speed", "dir"])?;
+    let has = |k: &str| opts.iter().any(|(o, _)| o == k);
+    ensure!(!rainbow || mode.has_rainbow(), "{} has no rainbow option", mode.name());
+    ensure!(
+        !has("color") || mode.has_color(),
+        "{} doesn't take a colour",
+        mode.name()
+    );
+    ensure!(!has("speed") || mode.has_speed(), "{} has no speed", mode.name());
+    ensure!(
+        !has("dir") || mode.has_horizontal() || mode.has_vertical(),
+        "{} has no direction",
+        mode.name()
+    );
+    let d = Saved::default();
+    let dir_default = Direction::ALL[d.direction as usize];
     Ok(Light {
         mode,
-        rgb: opt(&opts, "color", [0xff, 0x9a, 0x1f], parse_hex)?,
+        rgb: opt(&opts, "color", d.rgb, parse_hex)?,
         rainbow,
-        brightness: Level::new(opt(&opts, "brightness", Level::MAX, |v| parse_in(v, 0..=Level::MAX))?),
-        speed: Level::new(opt(&opts, "speed", 3, |v| parse_in(v, 0..=Level::MAX))?),
-        direction: opt(&opts, "dir", Direction::Right, |v| match v {
+        brightness: Level::new(opt(&opts, "brightness", d.brightness, |v| parse_in(v, 0..=Level::MAX))?),
+        speed: Level::new(opt(&opts, "speed", d.speed, |v| parse_in(v, 0..=Level::MAX))?),
+        direction: opt(&opts, "dir", dir_default, |v| match v {
             "left" => Ok(Direction::Left),
             "right" => Ok(Direction::Right),
             "up" => Ok(Direction::Up),
@@ -170,11 +191,13 @@ fn parse_light(effect: &str, opts: &[String]) -> Result<Light> {
 }
 
 fn kv(opts: &[String]) -> Result<Vec<(String, String)>> {
+    let mut seen = std::collections::HashSet::new();
     opts.iter()
         .map(|o| {
             let (k, v) = o
                 .split_once('=')
                 .with_context(|| format!("expected key=value, got `{o}`"))?;
+            ensure!(seen.insert(k.to_string()), "`{k}` given twice");
             Ok((k.to_string(), v.to_string()))
         })
         .collect()
@@ -205,15 +228,13 @@ fn parse_in<T: std::str::FromStr + PartialOrd + std::fmt::Debug>(
 }
 
 fn parse_hex(v: &str) -> Result<[u8; 3]> {
-    let v = v.trim_start_matches('#');
-    ensure!(v.len() == 6, "expected RRGGBB");
+    let v = v.strip_prefix('#').unwrap_or(v);
+    ensure!(
+        v.len() == 6 && v.bytes().all(|b| b.is_ascii_hexdigit()),
+        "expected RRGGBB"
+    );
     let n = u32::from_str_radix(v, 16)?;
     Ok([(n >> 16) as u8, (n >> 8) as u8, n as u8])
-}
-
-fn no_extra(rest: &[String]) -> Result<()> {
-    ensure!(rest.is_empty(), "unexpected arguments: {}", rest.join(" "));
-    Ok(())
 }
 
 #[cfg(test)]
@@ -226,10 +247,14 @@ mod tests {
 
     #[test]
     fn light_args() {
-        let l = parse_light("single-on", &args("color=#00ff80 brightness=2 dir=up rainbow")).unwrap();
+        let l = parse_light("rolling", &args("color=#00ff80 brightness=2 dir=left rainbow")).unwrap();
         assert_eq!(
             (l.mode.name(), l.rgb, l.brightness.get(), l.direction, l.rainbow),
-            ("Single On", [0, 255, 128], 2, Direction::Up, true)
+            ("Rolling", [0, 255, 128], 2, Direction::Left, true)
+        );
+        assert!(
+            parse_light("single-on", &args("dir=up")).is_err(),
+            "Single On has no direction"
         );
         assert!(parse_light("nope", &[]).is_err());
         assert!(
@@ -241,6 +266,21 @@ mod tests {
             "typos are caught"
         );
         assert!(parse_light("static", &args("color=12345")).is_err());
+        assert!(parse_light("static", &args("color=+12345")).is_err(), "no sign tricks");
+        assert!(
+            parse_light("static", &args("color=ff0000 color=00ff00")).is_err(),
+            "duplicates rejected"
+        );
+        assert!(
+            parse_light("spectrum", &args("color=ff0000")).is_err(),
+            "Spectrum takes no colour"
+        );
+        assert!(parse_light("static", &args("speed=2")).is_err(), "Static has no speed");
+        assert_eq!(
+            parse_light("static", &[]).unwrap().rgb,
+            Saved::default().rgb,
+            "same defaults as the GUI"
+        );
         // These fail on argument checks, before any device access.
         assert!(dispatch(&args("screen x.gif")).is_err(), "screen needs --yes");
         assert!(dispatch(&args("light")).is_err());
