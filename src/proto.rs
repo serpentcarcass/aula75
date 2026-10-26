@@ -17,6 +17,7 @@
 use crate::layout::KEYS;
 use anyhow::{Context, Result, bail, ensure};
 use hidapi::{HidApi, HidDevice};
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -302,7 +303,25 @@ pub struct Keyboard {
     instance: String,
     dir: PathBuf,
     _lock: File,
+    /// When the last stored write finished; the firmware stays busy for a moment after one.
+    last_write: Cell<Option<Instant>>,
 }
+
+/// The keyboard was busy before anything but `04 18` was sent: nothing can be half-written,
+/// so it's safe to simply try again later (no replug needed).
+#[derive(Debug)]
+pub struct Busy;
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("keyboard is busy, try again in a moment")
+    }
+}
+
+impl std::error::Error for Busy {}
+
+// Gap after a stored write before starting the next one (the board is busy saving it).
+const COOLDOWN: Duration = Duration::from_millis(250);
 
 pub const INTERRUPTED: &str =
     "A previous write was interrupted. Unplug the keyboard for a few seconds and plug it back in.";
@@ -442,6 +461,7 @@ impl Keyboard {
             instance,
             dir,
             _lock: lock,
+            last_write: Cell::new(None),
         })
     }
 
@@ -458,8 +478,47 @@ impl Keyboard {
     /// this board until it is replugged. Without a marker on disk, nothing is written.
     fn guarded(&self, op: impl FnOnce() -> Result<()>) -> Result<()> {
         set_marker(&self.dir, &self.instance).context("cannot record the write in progress; refusing to write")?;
-        op()?;
-        std::fs::remove_file(self.dir.join(MARKER)).context("write applied, but its safety marker could not be cleared")
+        let res = op();
+        self.last_write.set(Some(Instant::now()));
+        match res {
+            // Refused at `04 18`: nothing was written, so no replug is needed.
+            Err(e) if !e.is::<Busy>() => Err(e),
+            r => {
+                std::fs::remove_file(self.dir.join(MARKER))
+                    .context("write applied, but its safety marker could not be cleared")?;
+                r
+            }
+        }
+    }
+
+    /// `04 18`, after the post-write cooldown. The driver ignores a busy reply here; we instead
+    /// retry, and if the board stays busy report `Busy` before sending anything else.
+    fn begin(&self) -> Result<()> {
+        if let Some(t) = self.last_write.get() {
+            sleep(COOLDOWN.saturating_sub(t.elapsed()));
+        }
+        for _ in 0..3 {
+            self.send(&Cmd::Begin.packet(0))?;
+            let r = self.settled_reply(Cmd::Begin)?;
+            if r[0] == 0x04 && r[1] == Cmd::Begin as u8 && r[3] != 0xff {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100));
+        }
+        Err(Busy.into())
+    }
+
+    /// Reads the reply; while it says busy (FF), reads again (nothing is re-sent), up to ~150 ms.
+    fn settled_reply(&self, cmd: Cmd) -> Result<[u8; 64]> {
+        let mut r = self.reply(cmd)?;
+        for _ in 0..5 {
+            if r[3] != 0xff {
+                break;
+            }
+            sleep(Duration::from_millis(30));
+            r = self.reply(cmd)?;
+        }
+        Ok(r)
     }
 
     fn send(&self, p: &[u8; 64]) -> Result<()> {
@@ -484,7 +543,7 @@ impl Keyboard {
     /// set_feature + get_feature + ack check, like the driver's FUN_0044eeb0 with readback on.
     fn step(&self, cmd: Cmd, p: &[u8; 64]) -> Result<()> {
         self.send(p)?;
-        check_ack(cmd, &self.reply(cmd)?)
+        check_ack(cmd, &self.settled_reply(cmd)?)
     }
 
     /// One live frame, mirroring FUN_004329c0 / FUN_0044f0a0:
@@ -572,7 +631,7 @@ impl Keyboard {
     }
 
     fn write_light(&self, packet: &[u8; 64]) -> Result<()> {
-        self.command(Cmd::Begin, 0)?;
+        self.begin()?;
         self.command(Cmd::Light, 1)?;
         self.send(packet)?;
         self.command(Cmd::Apply, 0)?;
@@ -593,7 +652,7 @@ impl Keyboard {
                 Level(0),
                 Direction::Left,
             ))?;
-            self.command(Cmd::Begin, 0)?;
+            self.begin()?;
             self.command(Cmd::PerKey, 9)?;
             self.data(&per_key_packet(keys))?;
             self.command(Cmd::Apply, 0)?;
@@ -616,7 +675,7 @@ impl Keyboard {
             p[8] = t.tm_sec.min(59) as u8;
             p[10] = t.tm_wday as u8;
             magic(&mut p);
-            self.command(Cmd::Begin, 0)?;
+            self.begin()?;
             self.command(Cmd::Clock, 1)?;
             self.send(&p)?;
             // The driver reads back after the clock data packet too (FUN_004238f0); the reply
@@ -638,7 +697,7 @@ impl Keyboard {
             let mut p = Cmd::Screen.packet(0);
             p[2] = 1;
             p[8..10].copy_from_slice(&pages.to_le_bytes());
-            self.command(Cmd::Begin, 0)?;
+            self.begin()?;
             self.step(Cmd::Screen, &p)?;
             let mut buf = vec![0u8; PAGE + 1];
             for (i, page) in blob.chunks(PAGE).enumerate() {

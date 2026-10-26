@@ -115,7 +115,12 @@ fn spawn_worker(
             let _ = mtx.send(m);
             ctx.request_repaint();
         };
-        let done = |r: Result<&'static str>| send(Msg::Done(r.map_err(|e| format!("{e:#}"))));
+        let done = |r: Result<&'static str>| {
+            if let Err(e) = &r {
+                eprintln!("aula75: {e:#}"); // full chain in the terminal, for diagnosing
+            }
+            send(Msg::Done(r.map_err(|e| format!("{e:#}"))))
+        };
         loop {
             let wait = if fx.is_some() {
                 next.saturating_duration_since(Instant::now())
@@ -285,7 +290,14 @@ fn device(kb: &mut Option<Keyboard>) -> Result<&Keyboard> {
 
 /// Runs a write, tagging its failure as `WriteFailed` (which locks writes until replug).
 fn write<T>(kb: &mut Option<Keyboard>, op: impl FnOnce(&Keyboard) -> Result<T>) -> Result<T> {
-    op(device(kb)?).map_err(|e| e.context(WriteFailed))
+    // `Busy` means refused before anything was written: no lock, just try again.
+    op(device(kb)?).map_err(|e| {
+        if e.is::<proto::Busy>() {
+            e
+        } else {
+            e.context(WriteFailed)
+        }
+    })
 }
 
 /// Read-only USB enumeration every 2 s; never opens or writes to the device.
