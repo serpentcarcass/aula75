@@ -43,7 +43,7 @@ The tool only knows the commands it needs, and every byte it sends was checked a
 
 ### Linux, prebuilt
 
-From the first tagged version on, download `aula-control-<version>-linux-x86_64.tar.gz` from [Releases](https://github.com/serpentcarcass/aula75/releases). It contains the binary, the udev rule, this README and the license. The binary needs the PipeWire and udev libraries, which every desktop distribution ships.
+From the first tagged version on, download `aula-control-<version>-linux-x86_64.tar.gz` from [Releases](https://github.com/serpentcarcass/aula75/releases). It contains the binary, the udev rule, this README and the license. The binary needs the PipeWire, ALSA and udev libraries, which every desktop distribution ships.
 
 ### From source
 
@@ -58,7 +58,7 @@ cargo run --release
 On Linux, install the build dependencies first. These are the Debian/Ubuntu package names; Arch has them under similar names:
 
 ```sh
-sudo apt install build-essential pkg-config clang libclang-dev libudev-dev \
+sudo apt install build-essential pkg-config clang libclang-dev libudev-dev libasound2-dev \
   libpipewire-0.3-dev libspa-0.2-dev libxkbcommon-dev libwayland-dev \
   libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 ```

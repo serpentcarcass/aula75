@@ -28,7 +28,7 @@ jobs:
           sudo rm -f /var/lib/man-db/auto-update
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config clang libclang-dev libudev-dev libpipewire-0.3-dev libspa-0.2-dev \
+            pkg-config clang libclang-dev libudev-dev libasound2-dev libpipewire-0.3-dev libspa-0.2-dev \
             libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
       # Pinned toolchain so a new Rust release's lints can't break CI under -D warnings.
