@@ -48,6 +48,10 @@ enum Job {
     Screen(Animation),
     Live(LiveCfg),
     StopLive,
+    /// Read the colours the keyboard shows right now into the per-key editor.
+    ReadKeys,
+    /// Keep polling what the keyboard shows (for the Lighting preview) while `true`.
+    Mirror(bool),
 }
 
 #[derive(Clone)]
@@ -62,6 +66,8 @@ struct LiveView {
     running: bool,
     colors: Vec<Rgb>,
     label: String,
+    /// Last colours read back from the keyboard while mirroring; empty when not mirroring.
+    mirror: Vec<Rgb>,
 }
 
 // ~30 fps, about what the driver's own music page manages.
@@ -72,7 +78,14 @@ enum Msg {
     Progress(u32),
     /// Live streaming stopped on its own; unrelated to the one-shot `busy` job.
     LiveStopped(String),
+    /// Mirroring stopped after a failed read.
+    MirrorStopped(String),
+    /// Colours read from the keyboard, in `KEYS` order.
+    Keys(Vec<Rgb>),
 }
+
+// The driver's Lighting page polls `04 F5` continuously; one read takes ~80 ms.
+const MIRROR_EVERY: Duration = Duration::from_millis(100);
 
 /// One worker owns the device, so transactions can never interleave: one-shot jobs run
 /// between live frames, never inside one.
@@ -92,6 +105,9 @@ fn spawn_worker(
         let mut fx: Option<Box<dyn Effect>> = None;
         let mut locked_at: Option<u32> = None; // plug counter value when a write failed
         let mut busy_frames = 0u32; // consecutive live frames the keyboard declined
+        let mut mirror = false;
+        let mut next_poll = Instant::now();
+        let mut seen_plugs = usb.plugs.load(Relaxed);
         let leds: Vec<LedIndex> = (0..KEYS.len()).filter_map(LedIndex::of_key).collect();
         let mut next = Instant::now();
         let send = |m: Msg| {
@@ -102,6 +118,10 @@ fn spawn_worker(
         loop {
             let wait = if fx.is_some() {
                 next.saturating_duration_since(Instant::now())
+            } else if mirror && locked_at.is_none() {
+                next_poll.saturating_duration_since(Instant::now())
+            } else if mirror {
+                Duration::from_secs(1) // locked: keep checking for the replug
             } else {
                 Duration::from_secs(3600)
             };
@@ -110,8 +130,20 @@ fn spawn_worker(
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            if locked_at.is_some_and(|at| usb.plugs.load(Relaxed) > at) {
+            let plugs = usb.plugs.load(Relaxed);
+            if plugs != seen_plugs {
+                seen_plugs = plugs;
+                kb = None; // replugged: the old handle is dead, reopen on next use
+            }
+            if locked_at.is_some_and(|at| plugs > at) {
                 locked_at = None; // replugged: firmware state is fresh again
+            }
+            if let Some(Job::Mirror(on)) = job {
+                mirror = on;
+                if !on {
+                    view.lock().unwrap().mirror.clear();
+                }
+                continue;
             }
             if let Some(job) = job {
                 let res = match job {
@@ -146,6 +178,11 @@ fn spawn_worker(
                         })
                     })
                     .map(|_| "Screen uploaded"),
+                    Job::ReadKeys => device(&mut kb).and_then(|k| k.read_leds()).map(|c| {
+                        send(Msg::Keys(leds.iter().map(|&l| c.get(l)).collect()));
+                        "Loaded colours from the keyboard"
+                    }),
+                    Job::Mirror(_) => unreachable!("handled above"),
                 };
                 if res.as_ref().is_err_and(|e| e.is::<WriteFailed>()) {
                     locked_at = Some(usb.plugs.load(Relaxed));
@@ -155,6 +192,21 @@ fn spawn_worker(
                 view.lock().unwrap().running = fx.is_some();
                 done(res);
                 continue;
+            }
+
+            if fx.is_none() && mirror && locked_at.is_none() && Instant::now() >= next_poll {
+                next_poll = Instant::now() + MIRROR_EVERY;
+                // Read-only, like the driver's own polling: a failure stops mirroring but doesn't lock.
+                match device(&mut kb).and_then(|k| k.read_leds()) {
+                    Ok(c) => view.lock().unwrap().mirror = leds.iter().map(|&l| c.get(l)).collect(),
+                    Err(err) => {
+                        mirror = false;
+                        kb = None;
+                        view.lock().unwrap().mirror.clear();
+                        send(Msg::MirrorStopped(format!("Mirror stopped: {err:#}")));
+                    }
+                }
+                ctx.request_repaint();
             }
 
             let Some(e) = fx.as_mut() else { continue };
@@ -213,13 +265,17 @@ impl std::fmt::Display for WriteFailed {
 
 impl std::error::Error for WriteFailed {}
 
-/// Opens the keyboard if needed (failure here touched nothing), then runs `op`,
-/// tagging its failure as `WriteFailed`.
-fn write<T>(kb: &mut Option<Keyboard>, op: impl FnOnce(&Keyboard) -> Result<T>) -> Result<T> {
+/// Opens the keyboard if needed. Failing here touched nothing.
+fn device(kb: &mut Option<Keyboard>) -> Result<&Keyboard> {
     if kb.is_none() {
         *kb = Some(Keyboard::open()?);
     }
-    op(kb.as_ref().unwrap()).map_err(|e| e.context(WriteFailed))
+    Ok(kb.as_ref().unwrap())
+}
+
+/// Runs a write, tagging its failure as `WriteFailed` (which locks writes until replug).
+fn write<T>(kb: &mut Option<Keyboard>, op: impl FnOnce(&Keyboard) -> Result<T>) -> Result<T> {
+    op(device(kb)?).map_err(|e| e.context(WriteFailed))
 }
 
 /// Read-only USB enumeration every 2 s; never opens or writes to the device.
@@ -284,6 +340,9 @@ struct App {
     sensitivity: f32,
     work_min: u32,
     rest_min: u32,
+    /// Lighting preview shows what the keyboard reports instead of a simulation.
+    mirror_on: bool,
+    mirror_sent: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -346,6 +405,8 @@ impl App {
             sensitivity: 0.0,
             work_min: 0,
             rest_min: 0,
+            mirror_on: false, // opt-in until `04 F5` has been confirmed on hardware
+            mirror_sent: false,
         };
         app.restore(Saved::default()); // single source of defaults
         app
@@ -420,12 +481,26 @@ impl App {
             .inner_margin(16)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                title_row(
-                    ui,
-                    "Preview",
-                    RichText::new("approximate · the real effect runs on the keyboard").color(MUTED),
-                );
-                keyboard(ui, false, |i, p| preview(&l, i, p, t));
+                let mirror = self.view.lock().unwrap().mirror.clone();
+                let live = self.mirror_on && mirror.len() == KEYS.len();
+                ui.horizontal(|ui| {
+                    label(ui, "Preview");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        toggle(ui, &mut self.mirror_on, "Mirror keyboard");
+                        ui.add_space(12.0);
+                        ui.label(if live {
+                            RichText::new("● live from the keyboard").color(OK).size(12.0)
+                        } else {
+                            RichText::new("simulated · approximate").color(MUTED).size(12.0)
+                        });
+                    });
+                });
+                ui.add_space(6.0);
+                if live {
+                    keyboard(ui, false, |i, _| rgb(mirror[i]));
+                } else {
+                    keyboard(ui, false, |i, p| preview(&l, i, p, t));
+                }
             });
         ui.add_space(12.0);
 
@@ -507,6 +582,14 @@ impl App {
                     }
                     if ui.button("Fill all").clicked() {
                         self.keys.fill(self.brush);
+                    }
+                    let can_read = !self.busy && self.usb.present.load(Relaxed);
+                    if ui
+                        .add_enabled(can_read, egui::Button::new("Load from keyboard"))
+                        .on_hover_text("Copy what the keyboard shows right now")
+                        .clicked()
+                    {
+                        self.run(Job::ReadKeys);
                     }
                 });
             });
@@ -1272,11 +1355,20 @@ impl eframe::App for App {
             match m {
                 Msg::Progress(p) => self.progress = Some(p),
                 Msg::LiveStopped(e) => self.status = Err(e),
+                Msg::MirrorStopped(e) => {
+                    self.status = Err(e);
+                    self.mirror_on = false; // don't immediately restart a mirror that just failed
+                }
+                Msg::Keys(k) => self.keys = k,
                 Msg::Done(r) => {
                     self.busy = false;
                     self.status = r;
                 }
             }
+        }
+        let want = self.tab == Tab::Lighting && self.mirror_on && self.usb.present.load(Relaxed);
+        if want != self.mirror_sent && self.jobs.send(Job::Mirror(want)).is_ok() {
+            self.mirror_sent = want;
         }
 
         egui::Panel::left("nav")

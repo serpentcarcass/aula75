@@ -48,6 +48,8 @@ enum Cmd {
     Clock = 0x28,
     Screen = 0x72,
     Realtime = 0x20,
+    /// Read-only: the colours the LEDs show right now.
+    ReadLeds = 0xf5,
 }
 
 impl Cmd {
@@ -188,6 +190,17 @@ impl Animation {
             out.push((rgb565(rgba), (*delay).clamp(30, 500)));
         }
         Ok(Self(out))
+    }
+}
+
+/// What every LED shows right now, as returned by `04 F5`: `[led, R, G, B]` at `led * 4`,
+/// the same layout as `04 23`.
+pub struct LedColors([u8; 576]);
+
+impl LedColors {
+    pub fn get(&self, LedIndex(i): LedIndex) -> [u8; 3] {
+        let o = i as usize * 4; // LedIndex comes from KEYS, max 121 -> 484..488
+        [self.0[o + 1], self.0[o + 2], self.0[o + 3]]
     }
 }
 
@@ -355,6 +368,30 @@ impl Keyboard {
         })
     }
 
+    /// Reads what the LEDs show right now, the way the driver's Lighting page mirrors the board
+    /// (FUN_0042aeb0 polling FUN_0044f380): `04 F5 09` (5 ms, ack status 01), then 9 feature-report
+    /// reads 3 ms apart (each within 360 ms) carrying 64 bytes each, then `04 02` like the driver.
+    /// Writes nothing. The driver first tries a 9-byte read that always fails on Windows before
+    /// any USB traffic; it is skipped here since on other OSes it could consume the reply.
+    pub fn read_leds(&self) -> Result<LedColors> {
+        self.send_wait(&Cmd::ReadLeds.packet(9), Duration::from_millis(5))?;
+        let r = self.reply(Cmd::ReadLeds)?;
+        check_ack(Cmd::ReadLeds, &r)?;
+        ensure!(r[3] == 0x01, "LED read not accepted ({:02x?})", &r[..4]);
+        let mut d = [0u8; 576];
+        for chunk in d.chunks_mut(64) {
+            sleep(Duration::from_millis(3));
+            let mut buf = [0u8; 65];
+            let t0 = Instant::now();
+            let n = self.cmd.get_feature_report(&mut buf)?;
+            ensure!(n == 65, "LED read: short chunk ({n} bytes)");
+            ensure!(t0.elapsed() <= Duration::from_millis(360), "LED read too slow");
+            chunk.copy_from_slice(&buf[1..]);
+        }
+        self.command(Cmd::Apply, 0)?;
+        Ok(LedColors(d))
+    }
+
     /// set, 5 ms, get; on a busy (FF) reply resend once, like FUN_0044f0a0. Returns the last reply.
     fn fast_step(&self, cmd: Cmd, p: &[u8; 64]) -> Result<[u8; 64]> {
         let mut r = [0; 64];
@@ -519,6 +556,12 @@ mod tests {
         assert_eq!(&rt.0[..8], &[KEYS[5].1, 1, 2, 3, 1, 4, 5, 6]); // packed, not at led*4
         assert!(rt.0[8..].iter().all(|&b| b == 0));
         assert_eq!(Cmd::Realtime.packet(8)[..9], [4, 0x20, 0, 0, 0, 0, 0, 0, 8]);
+
+        assert_eq!(Cmd::ReadLeds.packet(9)[..9], [4, 0xf5, 0, 0, 0, 0, 0, 0, 9]);
+        let esc = LedIndex::of_key(0).unwrap(); // Esc = LED 1
+        let mut raw = [0u8; 576];
+        raw[4..8].copy_from_slice(&[1, 10, 20, 30]);
+        assert_eq!(LedColors(raw).get(esc), [10, 20, 30]);
 
         assert!(
             check_ack(
