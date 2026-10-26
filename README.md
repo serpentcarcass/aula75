@@ -11,10 +11,10 @@ Written in Rust with an [egui](https://github.com/emilk/egui) interface. The ven
 |---|---|
 | **Lighting** | The 19 built-in effects plus "off", with colour, rainbow, brightness, speed and direction. Each effect only shows the settings it supports. The preview **mirrors the keyboard**: it shows the colours the keyboard reports it is displaying. **Pure R/G/B/W** buttons and a **colour curve** with one-click calibration (see below). |
 | **Per-key** | Paint individual keys and store them in the keyboard's user-lighting slot. **Load from keyboard** copies what it currently shows. |
-| **Live** | Effects computed on your computer and streamed in real time. Nothing is written to the keyboard's memory. <br>• **Music**: a spectrum visualiser driven by system audio (whatever is playing) or a microphone <br>• **Pomodoro**: F1–F12 burn down as a timer, and the board pulses when the phase changes <br>• **Effects**: the vendor driver's own nine real-time effects (Star, Rain, Flower, Breath, Spectrum, Spring, Vertical, Roll, Rotate), ported from its code and colour tables |
+| **Live** | Effects computed on your computer and streamed in real time. Nothing is written to the keyboard's memory. <br>• **Music**: a spectrum visualiser driven by system audio (whatever is playing) or a microphone, with your own bar and background colours <br>• **Pomodoro**: F1–F12 burn down as a timer in your focus and break colours, and the board pulses when the phase changes <br>• **Effects**: the vendor driver's own nine real-time effects (Star, Rain, Flower, Breath, Spectrum, Spring, Vertical, Roll, Rotate), ported from its code and colour tables <br>• Every live effect has a **Brightness** setting |
 | **Screen** | Put a PNG, JPG or animated GIF on the 128×128 TFT, or make one: rendered text (static or scrolling) or 32×32 pixel art. Up to 255 frames, with an animated preview. |
 | **Clock** | Set the TFT clock to your computer's local time. |
-| **Tray icon** | On Linux: Live controls from the status bar, and closing the window keeps live effects running. |
+| **Tray icon** | On Linux: Live controls from the status bar, and (optionally) closing the window keeps live effects running. |
 | **Command line** | The same actions for scripts and hooks, e.g. `aula-control light breath color=00c8ff`. |
 
 Settings are remembered between launches.
@@ -43,7 +43,7 @@ The tool only knows the commands it needs, and every byte it sends was checked a
 
 ### Linux, prebuilt
 
-From the first tagged version on, download `aula-control-<version>-linux-x86_64.tar.gz` from [Releases](https://github.com/serpentcarcass/aula75/releases). It contains the binary, the udev rule, this README and the license. The binary needs the PipeWire, ALSA and udev libraries, which every desktop distribution ships.
+Download `aula-control-<version>-linux-x86_64.tar.gz` from [Releases](https://github.com/serpentcarcass/aula75/releases). It contains the binary, the udev rule, a desktop entry with its icon, this README and the license. The binary needs the PipeWire, ALSA and udev libraries, which every desktop distribution ships.
 
 ### From source
 
@@ -65,6 +65,14 @@ sudo apt install build-essential pkg-config clang libclang-dev libudev-dev libas
 
 ### Linux setup
 
+To get the app in your launcher and dock with its icon (optional; from a release tarball):
+
+```sh
+install -Dm755 aula-control ~/.local/bin/aula-control
+install -Dm644 aula-control.desktop ~/.local/share/applications/aula-control.desktop
+install -Dm644 aula-control.png ~/.local/share/icons/hicolor/256x256/apps/aula-control.png
+```
+
 > [!NOTE]
 > The Linux build is checked by CI, but it **has not been tested on real hardware yet**. Reports are welcome.
 
@@ -79,7 +87,7 @@ Run it as your normal user from a desktop session, not with `sudo`.
 
 - **System audio** capture uses PipeWire and records what your default output is playing.
 - **Tray icon**: KDE shows it out of the box. **GNOME** needs the *AppIndicator and KStatusNotifierItem Support* extension.
-  - With the icon, closing the window keeps the app running. On X11 the window hides.
+  - With the icon, closing the window can keep the app running (Live tab → **Keep running in the tray**). It is on by default except on GNOME, where closing the window quits, so the dock's *Quit* works. With it on, the dock's *Quit* only hides the window; use *Quit* in the tray menu. On X11 the window hides.
   - On Wayland windows can't be hidden, so it minimises instead. Bring it back from the dock or Alt-Tab.
   - Without a tray host, closing the window quits.
 
@@ -93,7 +101,7 @@ The keyboard has to be connected **by USB cable**. The 2.4 GHz dongle and Blueto
 
 - **Lighting**: pick an effect, adjust it, then press **Apply lighting**. With **Mirror keyboard** on, the preview shows what the keyboard displays. Turn it off to see a simulation of the selected effect instead.
 - **Per-key**: drag to paint and right-click a key to pick up its colour, then press **Apply colours**. **Load from keyboard** starts from what it currently shows.
-- **Live**: choose Music, Pomodoro or one of the vendor Effects, then **Start live** and **Stop**. Settings take effect when you start.
+- **Live**: choose Music, Pomodoro or one of the vendor Effects, set its colours and brightness, then **Start live** and **Stop**. Settings take effect when you start. Colours are picked from a colour button (its popup also takes exact RGB values); **Default colours** resets them. The vendor Effects use the driver's own palettes, so they only have Speed and Brightness.
 - **Screen**: choose Image (drop a file onto the window), Text (then **Render**) or Pixel art. Tick the confirmation, then press **Upload to screen**. This replaces the animation stored on the keyboard.
 - **Clock**: press **Sync clock**.
 
@@ -117,6 +125,8 @@ aula-control clock
 aula-control screen cat.gif --yes
 aula-control live pomodoro focus=50 break=10   # Ctrl-C to stop
 aula-control live music                        # system audio
+aula-control live music low=00c8ff high=ff3dc8 bg=000000 brightness=60
+aula-control live pomodoro focus-color=ff0000 break-color=0000ff
 aula-control live spring speed=12              # a vendor effect
 ```
 
@@ -142,6 +152,7 @@ CI (GitHub Actions, Ubuntu) runs fmt, clippy and the tests on every push. On a `
 | `src/effects.rs` | Live effects: spectrum analysis, Pomodoro, ported vendor effects |
 | `src/screen.rs` | Screen frames: image/GIF decoding, text rendering, pixel art |
 | `src/tray.rs` | Linux status-bar icon (StatusNotifierItem over D-Bus) |
+| `src/icon.rs`, `assets/` | The app icon (`icon.svg` is the source, `icon.png` is embedded in the binary) |
 | `src/layout.rs`, `src/vendor_tables.rs` | Key layout, LED indices and effect tables taken from the vendor driver |
 
 ## License

@@ -49,7 +49,8 @@ jobs:
           cargo build --release
           name="aula-control-${GITHUB_REF_NAME}-linux-x86_64"
           mkdir "$name"
-          cp target/release/aula-control 70-aula-f75max.rules README.md LICENSE "$name/"
+          cp target/release/aula-control 70-aula-f75max.rules aula-control.desktop README.md LICENSE "$name/"
+          cp assets/icon.png "$name/aula-control.png"
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AULA F75 Max
+GenericName=Keyboard control
+Comment=Lighting, screen and live effects for the AULA F75 Max keyboard
+Exec=aula-control
+Icon=aula-control
+Terminal=false
+Categories=Utility;
+Keywords=keyboard;rgb;lighting;aula;
+StartupWMClass=aula-control

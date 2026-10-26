@@ -60,7 +60,37 @@ pub fn key_pos() -> Vec<(f32, f32)> {
 }
 
 fn hsv(h: f32, s: f32, v: f32) -> Rgb {
-    eframe::egui::ecolor::rgb_from_hsv((h, s, v)).map(|c| (c * 255.0) as u8)
+    eframe::egui::ecolor::rgb_from_hsv((h, s, v)).map(|c| (c * 255.0).round() as u8)
+}
+
+fn to_hsv(c: Rgb) -> (f32, f32, f32) {
+    eframe::egui::ecolor::hsv_from_rgb(c.map(|x| x as f32 / 255.0))
+}
+
+/// `a` → `b` through hue (shortest way round), so green → red passes through yellow, not mud.
+fn blend(mut a: (f32, f32, f32), mut b: (f32, f32, f32), t: f32) -> Rgb {
+    // Black, white and greys have no hue of their own (black no saturation either): take the
+    // other end's, so white → blue fades through light blues instead of swinging through red,
+    // and black → green is just green getting brighter.
+    let borrow = |c: &mut (f32, f32, f32), o: (f32, f32, f32)| {
+        if c.1 < 0.02 || c.2 < 0.02 {
+            c.0 = o.0;
+        }
+        if c.2 < 0.02 {
+            c.1 = o.1;
+        }
+    };
+    let (a0, b0) = (a, b);
+    borrow(&mut a, b0);
+    borrow(&mut b, a0);
+    let mut dh = b.0 - a.0;
+    if dh > 0.5 {
+        dh -= 1.0;
+    } else if dh < -0.5 {
+        dh += 1.0;
+    }
+    let mix = |x: f32, y: f32| x + (y - x) * t;
+    hsv((a.0 + dh * t).rem_euclid(1.0), mix(a.1, b.1), mix(a.2, b.2))
 }
 
 /// Colour curve: these LEDs are very non-linear, so even small amounts of a second channel wash
@@ -97,6 +127,17 @@ fn scale([r, g, b]: Rgb, k: f32) -> Rgb {
     [(r as f32 * k) as u8, (g as f32 * k) as u8, (b as f32 * k) as u8]
 }
 
+/// What is actually sent for one effect colour: the colour curve, then the live Brightness
+/// (`percent`) on the final value, so 50% is half the light whatever the curve. Raw effects
+/// (calibration) are sent as they are.
+pub fn shown(c: Rgb, raw: bool, gamma: f32, percent: u8) -> Rgb {
+    if raw {
+        c
+    } else {
+        scale(curve(c, gamma), percent as f32 / 100.0)
+    }
+}
+
 // ---------------------------------------------------------------- music
 
 pub fn input_devices() -> Vec<String> {
@@ -108,6 +149,22 @@ pub fn input_devices() -> Vec<String> {
 
 const FFT_LEN: usize = 2048;
 
+/// Bar colours: `low` at the bottom row, `high` at the top, `bg` for the unlit keys (sent as is).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MusicColours {
+    pub low: Rgb,
+    pub high: Rgb,
+    pub bg: Rgb,
+}
+
+impl MusicColours {
+    pub const DEFAULT: Self = Self {
+        low: [0, 255, 0],
+        high: [255, 0, 0],
+        bg: [6, 2, 15], // dim blue-violet
+    };
+}
+
 /// Spectrum bars: one band per keyboard column, bar height across the rows.
 pub struct Music {
     _stream: cpal::Stream,
@@ -117,6 +174,8 @@ pub struct Music {
     bands: Vec<f32>,
     peak: f32,
     pub sensitivity: f32,
+    bg: Rgb,
+    gradient: ((f32, f32, f32), (f32, f32, f32)),
 }
 
 impl Music {
@@ -125,7 +184,7 @@ impl Music {
     /// `device: None` = what the system is playing: recording from the default *output* device,
     /// which cpal turns into a loopback capture (Core Audio process tap on macOS 14.6+,
     /// sink capture on PipeWire). `Some(name)` = that input device (microphone, BlackHole, ...).
-    pub fn new(device: Option<&str>, sensitivity: f32) -> Result<Self> {
+    pub fn new(device: Option<&str>, sensitivity: f32, colours: MusicColours) -> Result<Self> {
         let host = cpal::default_host();
         let (dev, cfg) = match device {
             Some(name) => {
@@ -165,6 +224,8 @@ impl Music {
             bands: vec![0.0; Self::BANDS],
             peak: 1e-3,
             sensitivity,
+            bg: colours.bg,
+            gradient: (to_hsv(colours.low), to_hsv(colours.high)),
         })
     }
 
@@ -257,11 +318,10 @@ impl Effect for Music {
                 let band = ((x * Self::BANDS as f32) as usize).min(Self::BANDS - 1);
                 let h = 1.0 - y; // bottom row = 0, F-row = 1
                 let level = self.bands[band];
-                let color = hsv(0.33 - 0.33 * h, 1.0, 1.0); // green → yellow → red with height
                 if level >= h * 0.92 + 0.04 {
-                    color
+                    blend(self.gradient.0, self.gradient.1, h) // low → high with height
                 } else {
-                    scale(hsv(0.6 + x * 0.25, 0.9, 1.0), 0.06) // dim blue-violet bed
+                    self.bg
                 }
             })
             .collect()
@@ -276,14 +336,16 @@ pub struct Pomodoro {
     started: Instant,
     working: bool,
     fkeys: Vec<usize>, // F1..F12 in left-to-right order
+    work_colour: Rgb,
+    rest_colour: Rgb,
 }
 
-const WORK: Rgb = [255, 70, 20];
-const REST: Rgb = [30, 230, 120];
+pub const WORK: Rgb = [255, 70, 20];
+pub const REST: Rgb = [30, 230, 120];
 const FLASH: Duration = Duration::from_secs(4);
 
 impl Pomodoro {
-    pub fn new(work_min: u32, rest_min: u32) -> Self {
+    pub fn new(work_min: u32, rest_min: u32, work_colour: Rgb, rest_colour: Rgb) -> Self {
         let mut fkeys: Vec<usize> = (0..KEYS.len())
             .filter(|&i| KEYS[i].0.len() > 1 && KEYS[i].0.starts_with('F') && KEYS[i].0[1..].parse::<u8>().is_ok())
             .collect();
@@ -294,14 +356,16 @@ impl Pomodoro {
             started: Instant::now(),
             working: true,
             fkeys,
+            work_colour,
+            rest_colour,
         }
     }
 
     fn phase(&self) -> (Duration, Rgb) {
         if self.working {
-            (self.work, WORK)
+            (self.work, self.work_colour)
         } else {
-            (self.rest, REST)
+            (self.rest, self.rest_colour)
         }
     }
 
@@ -602,7 +666,7 @@ mod tests {
 
     #[test]
     fn pomodoro_bar() {
-        let mut p = Pomodoro::new(25, 5);
+        let mut p = Pomodoro::new(25, 5, WORK, REST);
         assert_eq!(p.fkeys.len(), 12);
         assert_eq!(KEYS[p.fkeys[0]].0, "F1");
         p.started -= FLASH + Duration::from_secs(60 * 25 / 2); // halfway through focus
@@ -616,7 +680,7 @@ mod tests {
     #[test]
     #[ignore]
     fn system_audio_loopback() {
-        let mut m = Music::new(None, 1.0).expect("open system audio");
+        let mut m = Music::new(None, 1.0, MusicColours::DEFAULT).expect("open system audio");
         for _ in 0..30 {
             std::thread::sleep(Duration::from_millis(100));
             m.analyse();
@@ -657,6 +721,36 @@ mod tests {
         let mut c = 0;
         assert!((0..500).all(|_| next_palette(&mut c) < 107));
         assert_eq!(VendorFx::from_name("spring"), Some(VendorFx::Spring));
+    }
+
+    #[test]
+    fn colour_blend() {
+        let (green, red) = (to_hsv([0, 255, 0]), to_hsv([255, 0, 0]));
+        assert_eq!(blend(green, red, 0.0), [0, 255, 0]);
+        assert_eq!(blend(green, red, 1.0), [255, 0, 0]);
+        // White → blue stays blue-ish all the way (no hue swing through red/magenta).
+        let m = blend(to_hsv([255, 255, 255]), to_hsv([0, 0, 255]), 0.5);
+        assert!(m[2] > 250 && m[0] == m[1] && m[0] > 100 && m[0] < 150, "{m:?}");
+        let m = blend(to_hsv([0, 0, 0]), to_hsv([0, 255, 0]), 0.5);
+        assert!(m[1] > 100 && m[0] == 0 && m[2] == 0, "{m:?}");
+        let mid = blend(green, red, 0.5);
+        assert!(
+            mid[0] > 250 && mid[1] > 250 && mid[2] < 5,
+            "green → red passes through yellow: {mid:?}"
+        );
+        // The hue takes the short way round: red → blue goes via magenta, never green.
+        let m = blend(to_hsv([255, 0, 0]), to_hsv([0, 0, 255]), 0.5);
+        assert!(m[1] < 5 && m[0] > 250 && m[2] > 250, "{m:?}");
+    }
+
+    #[test]
+    fn brightness_is_applied_after_the_curve() {
+        let c = [200, 100, 50];
+        assert_eq!(shown(c, false, 1.0, 100), c, "100% with no curve is untouched");
+        assert_eq!(shown(c, false, 1.0, 50), [100, 50, 25]);
+        // Half the brightness is half the curved value, not half before the curve.
+        assert_eq!(shown(c, false, 2.0, 50)[0], curve(c, 2.0)[0] / 2);
+        assert_eq!(shown(c, true, 2.0, 10), c, "raw colours are sent as they are");
     }
 
     #[test]

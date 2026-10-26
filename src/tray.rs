@@ -33,6 +33,8 @@ struct Icon {
     tx: mpsc::Sender<TrayCmd>,
     wake: Box<dyn Fn() + Send>,
     live: bool,
+    /// The app icon in a few sizes; empty if it didn't decode (then a theme icon is named).
+    pixmap: Vec<ksni::Icon>,
 }
 
 #[cfg(target_os = "linux")]
@@ -52,7 +54,14 @@ impl ksni::Tray for Icon {
         "AULA F75 Max".into()
     }
     fn icon_name(&self) -> String {
-        "input-keyboard".into() // freedesktop standard icon, present in every icon theme
+        if self.pixmap.is_empty() {
+            "input-keyboard".into() // freedesktop standard icon, present in every icon theme
+        } else {
+            String::new() // hosts prefer a name over the pixmap
+        }
+    }
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        self.pixmap.clone()
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         self.send(TrayCmd::Show);
@@ -86,12 +95,39 @@ impl ksni::Tray for Icon {
     }
 }
 
+/// Whether closing the window should keep the app running in the tray unless the user chose
+/// otherwise. On GNOME the tray is an optional extension and the dock's "Quit" is just a close
+/// request, so there closing quits by default; elsewhere the tray is the usual home.
+pub fn keep_running_by_default() -> bool {
+    !std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|p| p.eq_ignore_ascii_case("gnome")))
+}
+
 /// `wake` is called after every command so the (possibly hidden) window processes it.
 #[cfg(target_os = "linux")]
 pub fn spawn(wake: Box<dyn Fn() + Send>) -> Option<Tray> {
     use ksni::blocking::TrayMethods;
     let (tx, cmds) = mpsc::channel();
-    match (Icon { tx, wake, live: false }).spawn() {
+    let pixmap = [32, 64, 128]
+        .into_iter()
+        .filter_map(|side| {
+            let (side, rgba) = crate::icon::rgba(side)?;
+            // ARGB32, network byte order
+            let data = rgba.chunks_exact(4).flat_map(|p| [p[3], p[0], p[1], p[2]]).collect();
+            Some(ksni::Icon {
+                width: side as i32,
+                height: side as i32,
+                data,
+            })
+        })
+        .collect();
+    match (Icon {
+        tx,
+        wake,
+        live: false,
+        pixmap,
+    })
+    .spawn()
+    {
         Ok(handle) => Some(Tray { cmds, handle }),
         Err(e) => {
             eprintln!("aula-control: no status-bar icon ({e}); closing the window will quit");

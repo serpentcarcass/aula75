@@ -1,5 +1,6 @@
 mod cli;
 mod effects;
+mod icon;
 mod layout;
 mod proto;
 mod screen;
@@ -50,7 +51,8 @@ enum Job {
     PerKey(Vec<(LedIndex, [u8; 3])>, Level),
     Clock,
     Screen(Animation),
-    Live(LiveCfg),
+    /// The effect and its brightness in percent.
+    Live(LiveCfg, u8),
     StopLive,
     /// Read the colours the keyboard shows right now into the per-key editor.
     ReadKeys,
@@ -60,9 +62,21 @@ enum Job {
 
 #[derive(Clone)]
 enum LiveCfg {
-    Music { device: Option<String>, sensitivity: f32 },
-    Pomodoro { work: u32, rest: u32 },
-    Vendor { fx: effects::VendorFx, speed: u8 },
+    Music {
+        device: Option<String>,
+        sensitivity: f32,
+        colours: effects::MusicColours,
+    },
+    Pomodoro {
+        work: u32,
+        rest: u32,
+        work_colour: Rgb,
+        rest_colour: Rgb,
+    },
+    Vendor {
+        fx: effects::VendorFx,
+        speed: u8,
+    },
     Calibrate,
 }
 
@@ -112,6 +126,7 @@ fn spawn_worker(
     thread::spawn(move || {
         let mut kb: Option<Keyboard> = None;
         let mut fx: Option<Box<dyn Effect>> = None;
+        let mut brightness = 100u8; // live Brightness (percent) of the running effect
         let mut busy_frames = 0u32; // consecutive live frames the keyboard declined
         let mut mirror = false;
         let mut next_poll = Instant::now();
@@ -159,17 +174,25 @@ fn spawn_worker(
             let back = |c: Rgb| effects::uncurve(c, gamma);
             if let Some(job) = job {
                 let res = match job {
-                    Job::Live(cfg) => {
+                    Job::Live(cfg, percent) => {
                         let made: Result<Box<dyn Effect>> = match cfg {
-                            LiveCfg::Music { device, sensitivity } => {
-                                effects::Music::new(device.as_deref(), sensitivity).map(|m| Box::new(m) as _)
-                            }
-                            LiveCfg::Pomodoro { work, rest } => Ok(Box::new(effects::Pomodoro::new(work, rest))),
+                            LiveCfg::Music {
+                                device,
+                                sensitivity,
+                                colours,
+                            } => effects::Music::new(device.as_deref(), sensitivity, colours).map(|m| Box::new(m) as _),
+                            LiveCfg::Pomodoro {
+                                work,
+                                rest,
+                                work_colour,
+                                rest_colour,
+                            } => Ok(Box::new(effects::Pomodoro::new(work, rest, work_colour, rest_colour))),
                             LiveCfg::Vendor { fx, speed } => Ok(Box::new(effects::Vendor::new(fx, speed))),
                             LiveCfg::Calibrate => Ok(Box::new(effects::Calibration)),
                         };
                         made.map(|e| {
                             fx = Some(e);
+                            brightness = percent;
                             busy_frames = 0;
                             "Live effect running"
                         })
@@ -247,7 +270,7 @@ fn spawn_worker(
                 &leds
                     .iter()
                     .copied()
-                    .zip(colors.iter().map(|&c| if e.raw() { c } else { out(c) }))
+                    .zip(colors.iter().map(|&c| effects::shown(c, e.raw(), gamma, brightness)))
                     .collect::<Vec<_>>(),
             );
             let res = write(&mut kb, |k| k.stream(&frame));
@@ -401,6 +424,11 @@ struct App {
     sensitivity: f32,
     work_min: u32,
     rest_min: u32,
+    music_colours: effects::MusicColours,
+    work_colour: Rgb,
+    rest_colour: Rgb,
+    /// Live brightness in percent.
+    live_brightness: u8,
     /// Lighting preview shows what the keyboard reports instead of a simulation.
     mirror_on: bool,
     mirror_sent: bool,
@@ -409,6 +437,8 @@ struct App {
     /// Status-bar icon (Linux with a tray host); with it, closing the window only hides it.
     tray: Option<tray::Tray>,
     tray_live: bool,
+    /// Closing the window hides it (tray) instead of quitting; only with a tray icon.
+    keep_in_tray: bool,
     hidden: bool,
     quitting: bool,
     /// Mirroring paused after a failed read; cleared by the toggle or a replug. Not saved, so one
@@ -503,11 +533,16 @@ impl App {
             sensitivity: 0.0,
             work_min: 0,
             rest_min: 0,
+            music_colours: effects::MusicColours::DEFAULT,
+            work_colour: [0; 3],
+            rest_colour: [0; 3],
+            live_brightness: 0,
             mirror_on: false,
             mirror_sent: false,
             curve: Default::default(),
             tray: None,
             tray_live: false,
+            keep_in_tray: true,
             hidden: false,
             mirror_failed: false,
             seen_plugs: 0,
@@ -538,6 +573,13 @@ impl App {
             sensitivity: self.sensitivity,
             work_min: self.work_min,
             rest_min: self.rest_min,
+            music_low: self.music_colours.low,
+            music_high: self.music_colours.high,
+            music_bg: self.music_colours.bg,
+            work_colour: self.work_colour,
+            rest_colour: self.rest_colour,
+            live_brightness: self.live_brightness,
+            keep_in_tray: self.keep_in_tray,
             mirror: self.mirror_on,
         }
     }
@@ -580,24 +622,39 @@ impl App {
         }
         self.work_min = s.work_min.clamp(*FOCUS_MIN.start(), *FOCUS_MIN.end());
         self.rest_min = s.rest_min.clamp(*BREAK_MIN.start(), *BREAK_MIN.end());
+        self.music_colours = effects::MusicColours {
+            low: s.music_low,
+            high: s.music_high,
+            bg: s.music_bg,
+        };
+        self.work_colour = s.work_colour;
+        self.rest_colour = s.rest_colour;
+        self.live_brightness = s
+            .live_brightness
+            .clamp(*LIVE_BRIGHTNESS.start(), *LIVE_BRIGHTNESS.end());
         self.mirror_on = s.mirror;
+        self.keep_in_tray = s.keep_in_tray;
     }
 
-    fn live_cfg(&self, kind: LiveKind) -> LiveCfg {
-        match kind {
+    fn live_job(&self, kind: LiveKind) -> Job {
+        let cfg = match kind {
             LiveKind::Music => LiveCfg::Music {
                 device: self.audio_device.clone(),
                 sensitivity: self.sensitivity,
+                colours: self.music_colours,
             },
             LiveKind::Pomodoro => LiveCfg::Pomodoro {
                 work: self.work_min,
                 rest: self.rest_min,
+                work_colour: self.work_colour,
+                rest_colour: self.rest_colour,
             },
             LiveKind::Vendor => LiveCfg::Vendor {
                 fx: self.vendor_fx,
                 speed: self.vendor_speed,
             },
-        }
+        };
+        Job::Live(cfg, self.live_brightness)
     }
 
     fn busy(&self) -> bool {
@@ -778,7 +835,7 @@ impl App {
         });
         // Calibration streams a test pattern (live frames, nothing stored) until a row is picked.
         if start_cal {
-            self.run(Job::Live(LiveCfg::Calibrate));
+            self.run(Job::Live(LiveCfg::Calibrate, 100));
         }
         if let Some(applied) = pick {
             self.queue(Job::StopLive);
@@ -986,7 +1043,8 @@ impl App {
                     LiveKind::Vendor => "The vendor driver's own real-time effects, ported from its code and colour tables.",
                 }).color(MUTED).size(12.0));
             });
-            card(&mut c[1], "Settings · applied on start", |ui| match self.live_kind {
+            card(&mut c[1], "Settings · applied on start", |ui| {
+                match self.live_kind {
                 LiveKind::Music => {
                     label(ui, "Audio source");
                     ui.horizontal(|ui| {
@@ -1007,6 +1065,14 @@ impl App {
                         ui.add_sized([86.0, 20.0], egui::Label::new("Sensitivity"));
                         ui.add(egui::Slider::new(&mut self.sensitivity, SENSITIVITY).fixed_decimals(1));
                     });
+                    ui.add_space(6.0);
+                    let c = &mut self.music_colours;
+                    colour_row(ui, "Low bars", &mut c.low);
+                    colour_row(ui, "High bars", &mut c.high);
+                    colour_row(ui, "Background", &mut c.bg);
+                    if ui.button("Default colours").clicked() {
+                        *c = effects::MusicColours::DEFAULT;
+                    }
                 }
                 LiveKind::Vendor => {
                     label(ui, "Effect");
@@ -1036,9 +1102,35 @@ impl App {
                         ui.add_sized([86.0, 20.0], egui::Label::new("Break"));
                         ui.add(egui::Slider::new(&mut self.rest_min, BREAK_MIN).suffix(" min"));
                     });
+                    ui.add_space(6.0);
+                    colour_row(ui, "Focus colour", &mut self.work_colour);
+                    colour_row(ui, "Break colour", &mut self.rest_colour);
+                    if ui.button("Default colours").clicked() {
+                        (self.work_colour, self.rest_colour) = (effects::WORK, effects::REST);
+                    }
                 }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([86.0, 20.0], egui::Label::new("Brightness"));
+                    ui.add(egui::Slider::new(&mut self.live_brightness, LIVE_BRIGHTNESS).suffix("%"));
+                });
             });
         });
+        if self.tray.is_some() {
+            card(ui, "Window", |ui| {
+                toggle(
+                    ui,
+                    &mut self.keep_in_tray,
+                    "Keep running in the tray when the window is closed",
+                );
+                ui.label(
+                    RichText::new("Live effects keep going. With this on, the dock's Quit only hides the window; use Quit in the tray menu.")
+                        .color(MUTED)
+                        .size(12.0),
+                );
+            });
+        }
         if running {
             ui.ctx().request_repaint_after(FRAME);
         }
@@ -1125,7 +1217,7 @@ impl App {
                                 self.run(Job::StopLive);
                             }
                         } else if primary(ui, "Start live", ready) {
-                            self.run(Job::Live(self.live_cfg(self.live_kind)));
+                            self.run(self.live_job(self.live_kind));
                         }
                     }
                 }
@@ -1541,6 +1633,15 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool, text: &str) -> bool {
     *on != before
 }
 
+/// Name and a colour button (the popup has a hex field).
+fn colour_row(ui: &mut egui::Ui, name: &str, value: &mut Rgb) {
+    ui.horizontal(|ui| {
+        ui.add_sized([86.0, 20.0], egui::Label::new(name));
+        ui.color_edit_button_srgb(value)
+            .on_hover_text("Pick a colour (the popup also takes exact RGB values)");
+    });
+}
+
 fn dot(ui: &mut egui::Ui, c: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 6.0, c.gamma_multiply(0.25));
@@ -1653,6 +1754,7 @@ fn nav(ui: &mut egui::Ui, icon: Icon, text: &str, selected: bool) -> bool {
 const SENSITIVITY: std::ops::RangeInclusive<f32> = 0.5..=3.0;
 const FOCUS_MIN: std::ops::RangeInclusive<u32> = 5..=90;
 const BREAK_MIN: std::ops::RangeInclusive<u32> = 1..=30;
+const LIVE_BRIGHTNESS: std::ops::RangeInclusive<u8> = 10..=100;
 
 /// What survives a restart, and the app's defaults. Plain values only; `App::restore`
 /// re-validates them. Fields missing from an older file take these defaults, not zero.
@@ -1677,6 +1779,13 @@ struct Saved {
     sensitivity: f32,
     work_min: u32,
     rest_min: u32,
+    music_low: [u8; 3],
+    music_high: [u8; 3],
+    music_bg: [u8; 3],
+    work_colour: [u8; 3],
+    rest_colour: [u8; 3],
+    live_brightness: u8,
+    keep_in_tray: bool,
     mirror: bool,
 }
 
@@ -1701,6 +1810,13 @@ impl Default for Saved {
             sensitivity: 1.2,
             work_min: 25,
             rest_min: 5,
+            music_low: effects::MusicColours::DEFAULT.low,
+            music_high: effects::MusicColours::DEFAULT.high,
+            music_bg: effects::MusicColours::DEFAULT.bg,
+            work_colour: effects::WORK,
+            rest_colour: effects::REST,
+            live_brightness: 100,
+            keep_in_tray: tray::keep_running_by_default(),
             mirror: true, // 04 F5 confirmed on hardware
         }
     }
@@ -1763,8 +1879,8 @@ impl eframe::App for App {
                 }
                 // Queued straight to the worker (which serialises everything) so a click from the
                 // tray isn't dropped while the window is busy with something else.
-                tray::TrayCmd::Music => drop(self.queue(Job::Live(self.live_cfg(LiveKind::Music)))),
-                tray::TrayCmd::Pomodoro => drop(self.queue(Job::Live(self.live_cfg(LiveKind::Pomodoro)))),
+                tray::TrayCmd::Music => drop(self.queue(self.live_job(LiveKind::Music))),
+                tray::TrayCmd::Pomodoro => drop(self.queue(self.live_job(LiveKind::Pomodoro))),
                 tray::TrayCmd::StopLive => drop(self.queue(Job::StopLive)),
                 tray::TrayCmd::Quit => {
                     self.quitting = true;
@@ -1782,7 +1898,7 @@ impl eframe::App for App {
 
         // With a tray icon, the close button keeps the app (and live effects) running: it hides
         // the window, or on Wayland, where windows can't be hidden, minimises it.
-        if self.tray.is_some() && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+        if self.tray.is_some() && self.keep_in_tray && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             let wayland = cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some();
             ctx.send_viewport_cmd(if wayland {
@@ -1888,12 +2004,17 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("AULA F75 Max")
+        .with_app_id("aula-control") // lets GNOME/KDE match the window to the app (dock grouping)
+        .with_inner_size([1180.0, 820.0])
+        .with_min_inner_size([900.0, 620.0])
+        .with_drag_and_drop(true);
+    if let Some(icon) = icon::window(256) {
+        viewport = viewport.with_icon(icon);
+    }
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("AULA F75 Max")
-            .with_inner_size([1180.0, 820.0])
-            .with_min_inner_size([900.0, 620.0])
-            .with_drag_and_drop(true),
+        viewport,
         ..Default::default()
     };
     eframe::run_native("aula-control", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
@@ -1919,6 +2040,7 @@ mod tests {
             sensitivity: f32::NAN,
             work_min: 0,
             rest_min: 10_000,
+            live_brightness: 0,
             ..Default::default()
         });
         assert_eq!(app.light.mode, defaults.0);
@@ -1933,6 +2055,7 @@ mod tests {
         );
         assert_eq!(app.light.direction, Direction::Right);
         assert_eq!((app.sensitivity, app.work_min, app.rest_min), (1.2, 5, 30));
+        assert_eq!(app.live_brightness, 10, "live brightness never goes dark");
 
         // And a good file round-trips.
         let mut saved = app.saved();
@@ -1948,6 +2071,11 @@ mod tests {
         assert_eq!(
             (s.mode.as_str(), s.brightness, s.work_min, s.keys.len()),
             ("Breath", 5, 25, KEYS.len())
+        );
+        assert_eq!(
+            (s.live_brightness, s.music_low, s.work_colour),
+            (100, effects::MusicColours::DEFAULT.low, effects::WORK),
+            "an older settings file keeps the default live look"
         );
     }
 

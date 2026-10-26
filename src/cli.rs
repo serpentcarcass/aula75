@@ -7,7 +7,7 @@
 use crate::effects::{self, Effect};
 use crate::layout::KEYS;
 use crate::proto::{Animation, Direction, Keyboard, LedIndex, Level, Light, Mode, RtFrame, Sent};
-use crate::{BREAK_MIN, FOCUS_MIN, SENSITIVITY, Saved};
+use crate::{BREAK_MIN, FOCUS_MIN, LIVE_BRIGHTNESS, SENSITIVITY, Saved};
 use anyhow::{Context, Result, bail, ensure};
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
@@ -20,10 +20,14 @@ usage: aula-control [command]          (no command: open the window)
   light <effect> [color=RRGGBB] [brightness=0-5] [speed=0-5] [dir=left|right|up|down] [rainbow]
   clock                                set the screen clock to local time
   screen <image> --yes                 upload a PNG/JPG/GIF to the screen (replaces the stored one)
-  live music [device=NAME] [sensitivity=0.5-3]
-  live pomodoro [focus=5-90] [break=1-30]
+  live music [device=NAME] [sensitivity=0.5-3] [low=RRGGBB] [high=RRGGBB] [bg=RRGGBB]
+  live pomodoro [focus=5-90] [break=1-30] [focus-color=RRGGBB] [break-color=RRGGBB]
   live <star|rain|flower|breath|spectrum|spring|vertical|roll|rotate> [speed=1-15]
-                                       stream until Ctrl-C (nothing is stored on the keyboard)";
+                                       stream until Ctrl-C (nothing is stored on the keyboard);
+                                       every live effect also takes brightness=10-100 (percent)";
+
+/// Builds the effect once the keyboard is ours.
+type Make = Box<dyn FnOnce() -> Result<Box<dyn Effect>>>;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -83,28 +87,43 @@ fn dispatch(args: &[String]) -> Result<()> {
             let opts = kv(opts)?;
             let d = Saved::default();
             // Built only after the keyboard is ours, so a busy keyboard never starts audio capture.
-            let make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>> = match kind.as_str() {
+            let (make, percent): (Make, u8) = match kind.as_str() {
                 "music" => {
-                    known(&opts, &["sensitivity", "device"])?;
+                    known(&opts, &["sensitivity", "device", "low", "high", "bg", "brightness"])?;
                     let sens = opt(&opts, "sensitivity", d.sensitivity, |v| parse_in(v, SENSITIVITY))?;
                     let device = opts.iter().find(|(k, _)| k == "device").map(|(_, v)| v.clone());
-                    Box::new(move || Ok(Box::new(effects::Music::new(device.as_deref(), sens)?) as _))
+                    let colours = effects::MusicColours {
+                        low: opt(&opts, "low", d.music_low, parse_hex)?,
+                        high: opt(&opts, "high", d.music_high, parse_hex)?,
+                        bg: opt(&opts, "bg", d.music_bg, parse_hex)?,
+                    };
+                    let make =
+                        Box::new(move || Ok(Box::new(effects::Music::new(device.as_deref(), sens, colours)?) as _));
+                    (make, brightness(&opts, &d)?)
                 }
                 "pomodoro" => {
-                    known(&opts, &["focus", "break"])?;
+                    known(&opts, &["focus", "break", "focus-color", "break-color", "brightness"])?;
                     let focus = opt(&opts, "focus", d.work_min, |v| parse_in(v, FOCUS_MIN))?;
                     let rest = opt(&opts, "break", d.rest_min, |v| parse_in(v, BREAK_MIN))?;
-                    Box::new(move || Ok(Box::new(effects::Pomodoro::new(focus, rest)) as _))
+                    let (work_colour, rest_colour) = (
+                        opt(&opts, "focus-color", d.work_colour, parse_hex)?,
+                        opt(&opts, "break-color", d.rest_colour, parse_hex)?,
+                    );
+                    let make: Make = Box::new(move || {
+                        Ok(Box::new(effects::Pomodoro::new(focus, rest, work_colour, rest_colour)) as _)
+                    });
+                    (make, brightness(&opts, &d)?)
                 }
                 other => {
                     let fx = effects::VendorFx::from_name(other)
                         .with_context(|| format!("live: unknown effect `{other}`"))?;
-                    known(&opts, &["speed"])?;
+                    known(&opts, &["speed", "brightness"])?;
                     let speed = opt(&opts, "speed", d.vendor_speed, |v| parse_in(v, effects::VENDOR_SPEED))?;
-                    Box::new(move || Ok(Box::new(effects::Vendor::new(fx, speed)) as _))
+                    let make: Make = Box::new(move || Ok(Box::new(effects::Vendor::new(fx, speed)) as _));
+                    (make, brightness(&opts, &d)?)
                 }
             };
-            stream(make)
+            stream(make, percent)
         }
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
@@ -120,7 +139,7 @@ fn write(op: impl FnOnce(&Keyboard) -> Result<()>) -> Result<()> {
 }
 
 /// Streams a live effect at ~30 fps until Ctrl-C, mirroring the GUI worker's rules.
-fn stream(make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>>) -> Result<()> {
+fn stream(make: Make, percent: u8) -> Result<()> {
     let k = Keyboard::open()?;
     let mut fx = make()?;
     let gamma = saved_curve();
@@ -134,11 +153,7 @@ fn stream(make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>>) -> Result<()> {
             &leds
                 .iter()
                 .copied()
-                .zip(
-                    colors
-                        .into_iter()
-                        .map(|c| if fx.raw() { c } else { effects::curve(c, gamma) }),
-                )
+                .zip(colors.into_iter().map(|c| effects::shown(c, fx.raw(), gamma, percent)))
                 .collect::<Vec<_>>(),
         );
         match k.stream(&frame) {
@@ -217,6 +232,11 @@ fn parse_light(effect: &str, opts: &[String]) -> Result<Light> {
             _ => bail!("dir must be left, right, up or down"),
         })?,
     })
+}
+
+/// The `brightness=` option shared by every live effect (percent).
+fn brightness(opts: &[(String, String)], d: &Saved) -> Result<u8> {
+    opt(opts, "brightness", d.live_brightness, |v| parse_in(v, LIVE_BRIGHTNESS))
 }
 
 fn kv(opts: &[String]) -> Result<Vec<(String, String)>> {
@@ -315,5 +335,11 @@ mod tests {
         assert!(dispatch(&args("light")).is_err());
         assert!(dispatch(&args("live disco")).is_err());
         assert!(dispatch(&args("live spring speed=16")).is_err(), "vendor speed range");
+        assert!(dispatch(&args("live spring brightness=5")).is_err(), "brightness range");
+        assert!(dispatch(&args("live music low=red")).is_err(), "colours are RRGGBB");
+        assert!(
+            dispatch(&args("live pomodoro low=ff0000")).is_err(),
+            "music option on pomodoro"
+        );
     }
 }
