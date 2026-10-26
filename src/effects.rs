@@ -1,6 +1,7 @@
 //! Host-side live effects. Each produces one colour per entry of `KEYS`, streamed via `04 20`.
 
 use crate::layout::KEYS;
+use crate::vendor_tables as vt;
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
@@ -286,6 +287,239 @@ impl Effect for Pomodoro {
     }
 }
 
+// ---------------------------------------------------------------- vendor effects
+
+/// The driver's own real-time effects (mui.dll `CustomLightMode::Update*Effect`), applied to the
+/// whole board. Step logic, tables, key groups and the `rgb * alpha >> 8` output (FUN_00427dc0)
+/// follow the driver; initial phases and the 10 ms base tick are approximations.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum VendorFx {
+    Star,
+    Rain,
+    Flower,
+    Breath,
+    Spectrum,
+    Spring,
+    Vertical,
+    Roll,
+    Rotate,
+}
+
+impl VendorFx {
+    pub const ALL: [VendorFx; 9] = [
+        VendorFx::Star,
+        VendorFx::Rain,
+        VendorFx::Flower,
+        VendorFx::Breath,
+        VendorFx::Spectrum,
+        VendorFx::Spring,
+        VendorFx::Vertical,
+        VendorFx::Roll,
+        VendorFx::Rotate,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            VendorFx::Star => "Star",
+            VendorFx::Rain => "Rain",
+            VendorFx::Flower => "Flower",
+            VendorFx::Breath => "Breath",
+            VendorFx::Spectrum => "Spectrum",
+            VendorFx::Spring => "Spring",
+            VendorFx::Vertical => "Vertical",
+            VendorFx::Roll => "Roll",
+            VendorFx::Rotate => "Rotate",
+        }
+    }
+}
+
+/// Vendor speed scale; the driver updates once every `15 - speed` timer ticks (SetSpeed).
+pub const VENDOR_SPEED: std::ops::RangeInclusive<u8> = 1..=15;
+const TICK: Duration = Duration::from_millis(10);
+
+pub struct Vendor {
+    fx: VendorFx,
+    period: Duration,
+    last: Instant,
+    groups: Vec<Vec<usize>>, // key indices per row / column / ring / sector, as the effect needs
+    phase: Vec<usize>,       // per key (Star, Flower) or per group (waves)
+    bright: Vec<usize>,      // per group brightness index into BRIGHT
+    rgb: Vec<Rgb>,           // per key colour before alpha
+    alpha: Vec<u8>,          // per key alpha
+    mask: Vec<u32>,          // Rain: per column drop bits
+    counter: i32,            // palette walk (0xf5c)
+    t: usize,                // Breath / Spectrum position
+}
+
+impl Vendor {
+    pub fn new(fx: VendorFx, speed: u8) -> Self {
+        let div = 15u32
+            .saturating_sub(speed.clamp(*VENDOR_SPEED.start(), *VENDOR_SPEED.end()) as u32)
+            .max(1);
+        let groups = match fx {
+            VendorFx::Rain | VendorFx::Roll | VendorFx::Breath => by_matrix(|_, c| c),
+            VendorFx::Vertical => by_matrix(|r, _| r),
+            VendorFx::Spring => by_hid(&vt::SPRING_RINGS, 12),
+            VendorFx::Rotate => by_hid(&vt::ROTATE_SECTORS, 3),
+            _ => vec![],
+        };
+        let n = KEYS.len();
+        let g = groups.len().max(1);
+        // Approximation: the driver's initial phases weren't reversed; spread them evenly.
+        let phase = match fx {
+            VendorFx::Star => (0..n).map(|k| k * 97 % 256).collect(),
+            VendorFx::Flower => (0..n).map(|k| k * 53 % 192).collect(),
+            _ => (0..g).map(|i| i * 192 / g).collect(),
+        };
+        Self {
+            fx,
+            period: TICK * div,
+            last: Instant::now(),
+            bright: (0..g).map(|i| i * 96 / g).collect(),
+            rgb: vec![[0; 3]; n],
+            alpha: vec![255; n],
+            mask: (0..g).map(|i| 1 << (i * 3 % 7)).collect(),
+            groups,
+            phase,
+            counter: 0,
+            t: 0,
+        }
+    }
+
+    /// The driver's pseudo-random palette walk: srand(0xe8) before every rand() makes rand()
+    /// always 796, so it's just a counter.
+    fn next_palette(&mut self) -> usize {
+        self.counter += 1;
+        if self.counter > 100 {
+            self.counter -= 100;
+        }
+        let i = (796 + self.counter as usize) & 0x7f;
+        if i < 0x6b { i } else { i - 0x6a }
+    }
+
+    fn step(&mut self) {
+        let sin = |i: usize| vt::SIN[i % 192];
+        let wave = |p: usize| [sin(p), sin(p + 64), sin(p + 128)];
+        match self.fx {
+            VendorFx::Star => {
+                for k in 0..self.rgb.len() {
+                    self.alpha[k] = self.phase[k] as u8;
+                    if self.phase[k] == 0 {
+                        self.phase[k] = 255;
+                        let i = self.next_palette() * 3;
+                        self.rgb[k] = [vt::STAR_PALETTE[i], vt::STAR_PALETTE[i + 1], vt::STAR_PALETTE[i + 2]];
+                    } else {
+                        self.phase[k] -= 1;
+                    }
+                }
+            }
+            VendorFx::Rain => {
+                for col in 0..self.groups.len() {
+                    self.mask[col] <<= 1;
+                    if self.mask[col] & 0x80 != 0 {
+                        self.mask[col] = 1;
+                    }
+                    for &k in &self.groups[col].clone() {
+                        if self.mask[col] & (1 << vt::KEY_MATRIX[k].1) != 0 {
+                            let i = self.next_palette() * 3;
+                            self.rgb[k] = [vt::RAIN_PALETTE[i], vt::RAIN_PALETTE[i + 1], vt::RAIN_PALETTE[i + 2]];
+                        }
+                    }
+                }
+            }
+            VendorFx::Flower => {
+                for k in 0..self.rgb.len() {
+                    self.phase[k] = (self.phase[k] + 1) % 192;
+                    self.rgb[k] = wave(self.phase[k]);
+                }
+            }
+            VendorFx::Breath => {
+                let a = vt::BREATH[self.t];
+                self.t = (self.t + 1) % 128;
+                for (col, keys) in self.groups.iter().enumerate() {
+                    let c = &vt::BREATH_COLUMNS[(col % 15) * 3..];
+                    for &k in keys {
+                        self.rgb[k] = [c[1], c[0], c[2]]; // stored G, R, B
+                        self.alpha[k] = a;
+                    }
+                }
+            }
+            VendorFx::Spectrum => {
+                self.t = (self.t + 1) % 192;
+                let c = [
+                    vt::SPEC[self.t],
+                    vt::SPEC[(self.t + 64) % 192],
+                    vt::SPEC[(self.t + 128) % 192],
+                ];
+                self.rgb.fill(c);
+            }
+            VendorFx::Spring | VendorFx::Rotate | VendorFx::Vertical | VendorFx::Roll => {
+                // Spring/Rotate run their waves forwards, Vertical/Roll backwards.
+                let fwd = matches!(self.fx, VendorFx::Spring | VendorFx::Rotate);
+                for (g, keys) in self.groups.iter().enumerate() {
+                    self.phase[g] = if fwd {
+                        (self.phase[g] + 1) % 192
+                    } else {
+                        (self.phase[g] + 191) % 192
+                    };
+                    self.bright[g] = if fwd {
+                        (self.bright[g] + 1) % 96
+                    } else {
+                        (self.bright[g] + 95) % 96
+                    };
+                    for &k in keys {
+                        self.rgb[k] = wave(self.phase[g]);
+                        self.alpha[k] = vt::BRIGHT[self.bright[g]];
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Effect for Vendor {
+    fn frame(&mut self) -> Vec<Rgb> {
+        // Catch up on the driver's update rate, but never spin after a long stall.
+        let due = (self.last.elapsed().as_micros() / self.period.as_micros().max(1)).min(20) as u32;
+        for _ in 0..due {
+            self.step();
+        }
+        self.last += self.period * due;
+        self.rgb
+            .iter()
+            .zip(&self.alpha)
+            .map(|(c, &a)| c.map(|x| ((x as u32 * a as u32) >> 8) as u8))
+            .collect()
+    }
+}
+
+/// Key indices grouped by matrix row or column (vendor `row_col`).
+fn by_matrix(key: impl Fn(usize, usize) -> usize) -> Vec<Vec<usize>> {
+    let mut g: Vec<Vec<usize>> = vec![];
+    for (k, &(_, r, c)) in vt::KEY_MATRIX.iter().enumerate() {
+        let i = key(r as usize, c as usize);
+        if g.len() <= i {
+            g.resize(i + 1, vec![]);
+        }
+        g[i].push(k);
+    }
+    g
+}
+
+/// Key indices for the driver's HID-code groups (`width` codes per group, 0 = empty slot).
+fn by_hid(table: &[u8], width: usize) -> Vec<Vec<usize>> {
+    table
+        .chunks(width)
+        .map(|codes| {
+            codes
+                .iter()
+                .filter(|&&c| c != 0)
+                .filter_map(|&c| vt::KEY_MATRIX.iter().position(|&(h, _, _)| h == c))
+                .collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +568,25 @@ mod tests {
                     .join(" ")
             );
         }
+    }
+
+    #[test]
+    fn vendor_effects() {
+        assert_eq!(vt::KEY_MATRIX.len(), KEYS.len());
+        for fx in VendorFx::ALL {
+            let mut v = Vendor::new(fx, 15);
+            v.last -= Duration::from_millis(500); // 50 steps due
+            let f = v.frame();
+            assert_eq!(f.len(), KEYS.len(), "{fx:?}");
+            assert!(f.iter().any(|c| c.iter().any(|&x| x > 0)), "{fx:?} lights something");
+        }
+        // Key groups: every key belongs to some row/column; Spring rings cover most of the board.
+        assert_eq!(by_matrix(|r, _| r).iter().map(Vec::len).sum::<usize>(), KEYS.len());
+        let ringed: usize = by_hid(&vt::SPRING_RINGS, 12).iter().map(Vec::len).sum();
+        assert!(ringed >= 70, "spring covers {ringed} keys");
+        // The palette walk stays inside the 107-colour palette.
+        let mut v = Vendor::new(VendorFx::Star, 8);
+        assert!((0..500).all(|_| v.next_palette() < 107));
     }
 
     #[test]

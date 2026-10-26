@@ -3,6 +3,7 @@ mod effects;
 mod layout;
 mod proto;
 mod tray;
+mod vendor_tables;
 
 use anyhow::{Context, Result};
 use effects::{Effect, Rgb};
@@ -60,6 +61,7 @@ enum Job {
 enum LiveCfg {
     Music { device: Option<String>, sensitivity: f32 },
     Pomodoro { work: u32, rest: u32 },
+    Vendor { fx: effects::VendorFx, speed: u8 },
 }
 
 /// What the worker is currently streaming, for the on-screen preview.
@@ -155,6 +157,7 @@ fn spawn_worker(
                                 effects::Music::new(device.as_deref(), sensitivity).map(|m| Box::new(m) as _)
                             }
                             LiveCfg::Pomodoro { work, rest } => Ok(Box::new(effects::Pomodoro::new(work, rest))),
+                            LiveCfg::Vendor { fx, speed } => Ok(Box::new(effects::Vendor::new(fx, speed))),
                         };
                         made.map(|e| {
                             fx = Some(e);
@@ -361,6 +364,8 @@ struct App {
     screen_confirm: bool,
     view: Arc<Mutex<LiveView>>,
     live_kind: LiveKind,
+    vendor_fx: effects::VendorFx,
+    vendor_speed: u8,
     audio_devices: Vec<String>,
     audio_device: Option<String>,
     sensitivity: f32,
@@ -384,6 +389,7 @@ struct App {
 enum LiveKind {
     Music,
     Pomodoro,
+    Vendor,
 }
 
 impl App {
@@ -437,6 +443,8 @@ impl App {
             screen_confirm: false,
             view,
             live_kind: LiveKind::Music,
+            vendor_fx: effects::VendorFx::Spring,
+            vendor_speed: 0,
             audio_devices: vec![],
             audio_device: None,
             sensitivity: 0.0,
@@ -467,6 +475,9 @@ impl App {
             brush: self.brush,
             key_brightness: self.key_brightness.get(),
             pomodoro: self.live_kind == LiveKind::Pomodoro,
+            vendor: self.live_kind == LiveKind::Vendor,
+            vendor_fx: self.vendor_fx.name().into(),
+            vendor_speed: self.vendor_speed,
             audio_device: self.audio_device.clone(),
             sensitivity: self.sensitivity,
             work_min: self.work_min,
@@ -493,11 +504,19 @@ impl App {
         }
         self.brush = s.brush;
         self.key_brightness = Level::new(s.key_brightness);
-        self.live_kind = if s.pomodoro {
+        self.live_kind = if s.vendor {
+            LiveKind::Vendor
+        } else if s.pomodoro {
             LiveKind::Pomodoro
         } else {
             LiveKind::Music
         };
+        if let Some(fx) = effects::VendorFx::ALL.into_iter().find(|f| f.name() == s.vendor_fx) {
+            self.vendor_fx = fx;
+        }
+        self.vendor_speed = s
+            .vendor_speed
+            .clamp(*effects::VENDOR_SPEED.start(), *effects::VENDOR_SPEED.end());
         self.audio_device = s.audio_device;
         if s.sensitivity.is_finite() {
             self.sensitivity = s.sensitivity.clamp(*SENSITIVITY.start(), *SENSITIVITY.end());
@@ -516,6 +535,10 @@ impl App {
             LiveKind::Pomodoro => LiveCfg::Pomodoro {
                 work: self.work_min,
                 rest: self.rest_min,
+            },
+            LiveKind::Vendor => LiveCfg::Vendor {
+                fx: self.vendor_fx,
+                speed: self.vendor_speed,
             },
         }
     }
@@ -796,8 +819,8 @@ impl App {
         ui.columns(2, |c| {
             card(&mut c[0], "Effect", |ui| {
                 ui.horizontal(|ui| {
-                    for (k, name) in [(LiveKind::Music, "Music"), (LiveKind::Pomodoro, "Pomodoro")] {
-                        if tile(ui, name, self.live_kind == k, Vec2::new(150.0, 40.0)).clicked() {
+                    for (k, name) in [(LiveKind::Music, "Music"), (LiveKind::Pomodoro, "Pomodoro"), (LiveKind::Vendor, "Effects")] {
+                        if tile(ui, name, self.live_kind == k, Vec2::new(120.0, 40.0)).clicked() {
                             self.live_kind = k;
                         }
                     }
@@ -806,6 +829,7 @@ impl App {
                 ui.label(RichText::new(match self.live_kind {
                     LiveKind::Music => "Spectrum bars across the columns, height across the rows.",
                     LiveKind::Pomodoro => "F1–F12 burn down as a timer; the whole board pulses when the phase changes.",
+                    LiveKind::Vendor => "The vendor driver's own real-time effects, ported from its code and colour tables.",
                 }).color(MUTED).size(12.0));
             });
             card(&mut c[1], "Settings · applied on start", |ui| match self.live_kind {
@@ -828,6 +852,25 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.add_sized([86.0, 20.0], egui::Label::new("Sensitivity"));
                         ui.add(egui::Slider::new(&mut self.sensitivity, SENSITIVITY).fixed_decimals(1));
+                    });
+                }
+                LiveKind::Vendor => {
+                    label(ui, "Effect");
+                    let w = (ui.available_width() - 12.0) / 3.0;
+                    for row in effects::VendorFx::ALL.chunks(3) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            for &fx in row {
+                                if tile(ui, fx.name(), self.vendor_fx == fx, Vec2::new(w, 32.0)).clicked() {
+                                    self.vendor_fx = fx;
+                                }
+                            }
+                        });
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_sized([86.0, 20.0], egui::Label::new("Speed"));
+                        ui.add(egui::Slider::new(&mut self.vendor_speed, effects::VENDOR_SPEED));
                     });
                 }
                 LiveKind::Pomodoro => {
@@ -1373,6 +1416,9 @@ struct Saved {
     brush: [u8; 3],
     key_brightness: u8,
     pomodoro: bool,
+    vendor: bool,
+    vendor_fx: String,
+    vendor_speed: u8,
     audio_device: Option<String>,
     sensitivity: f32,
     work_min: u32,
@@ -1393,6 +1439,9 @@ impl Default for Saved {
             brush: SWATCHES[5],
             key_brightness: 5,
             pomodoro: false,
+            vendor: false,
+            vendor_fx: "Spring".into(),
+            vendor_speed: 10,
             audio_device: None,
             sensitivity: 1.2,
             work_min: 25,

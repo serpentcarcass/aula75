@@ -22,6 +22,7 @@ usage: aula-control [command]          (no command: open the window)
   screen <image> --yes                 upload a PNG/JPG/GIF to the screen (replaces the stored one)
   live music [device=NAME] [sensitivity=0.5-3]
   live pomodoro [focus=5-90] [break=1-30]
+  live <star|rain|flower|breath|spectrum|spring|vertical|roll|rotate> [speed=1-15]
                                        stream until Ctrl-C (nothing is stored on the keyboard)";
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -94,7 +95,15 @@ fn dispatch(args: &[String]) -> Result<()> {
                     let rest = opt(&opts, "break", d.rest_min, |v| parse_in(v, BREAK_MIN))?;
                     Box::new(move || Ok(Box::new(effects::Pomodoro::new(focus, rest)) as _))
                 }
-                other => bail!("live: unknown effect `{other}` (music or pomodoro)"),
+                other => {
+                    let fx = effects::VendorFx::ALL
+                        .into_iter()
+                        .find(|f| f.name().eq_ignore_ascii_case(other))
+                        .with_context(|| format!("live: unknown effect `{other}`"))?;
+                    known(&opts, &["speed"])?;
+                    let speed = opt(&opts, "speed", d.vendor_speed, |v| parse_in(v, effects::VENDOR_SPEED))?;
+                    Box::new(move || Ok(Box::new(effects::Vendor::new(fx, speed)) as _))
+                }
             };
             stream(make)
         }
@@ -285,5 +294,6 @@ mod tests {
         assert!(dispatch(&args("screen x.gif")).is_err(), "screen needs --yes");
         assert!(dispatch(&args("light")).is_err());
         assert!(dispatch(&args("live disco")).is_err());
+        assert!(dispatch(&args("live spring speed=16")).is_err(), "vendor speed range");
     }
 }
