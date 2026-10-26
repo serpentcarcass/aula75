@@ -2,7 +2,7 @@ mod effects;
 mod layout;
 mod proto;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use effects::{Effect, Rgb};
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, Rect, RichText, Sense, Shadow, Stroke,
@@ -107,6 +107,7 @@ fn spawn_worker(
         let mut busy_frames = 0u32; // consecutive live frames the keyboard declined
         let mut mirror = false;
         let mut next_poll = Instant::now();
+        let mut mirror_misses = 0u32; // consecutive polls the keyboard declined
         let mut seen_plugs = usb.plugs.load(Relaxed);
         let leds: Vec<LedIndex> = (0..KEYS.len()).filter_map(LedIndex::of_key).collect();
         let mut next = Instant::now();
@@ -178,9 +179,10 @@ fn spawn_worker(
                         })
                     })
                     .map(|_| "Screen uploaded"),
-                    Job::ReadKeys => device(&mut kb).and_then(|k| k.read_leds()).map(|c| {
+                    Job::ReadKeys => device(&mut kb).and_then(|k| k.read_leds()).and_then(|c| {
+                        let c = c.context("keyboard is busy, try again")?;
                         send(Msg::Keys(leds.iter().map(|&l| c.get(l)).collect()));
-                        "Loaded colours from the keyboard"
+                        Ok("Loaded colours from the keyboard")
                     }),
                     Job::Mirror(_) => unreachable!("handled above"),
                 };
@@ -188,6 +190,7 @@ fn spawn_worker(
                     locked_at = Some(usb.plugs.load(Relaxed));
                     fx = None;
                     kb = None;
+                    view.lock().unwrap().mirror.clear(); // no stale "live" preview while locked
                 }
                 view.lock().unwrap().running = fx.is_some();
                 done(res);
@@ -198,7 +201,19 @@ fn spawn_worker(
                 next_poll = Instant::now() + MIRROR_EVERY;
                 // Read-only, like the driver's own polling: a failure stops mirroring but doesn't lock.
                 match device(&mut kb).and_then(|k| k.read_leds()) {
-                    Ok(c) => view.lock().unwrap().mirror = leds.iter().map(|&l| c.get(l)).collect(),
+                    Ok(Some(c)) => {
+                        mirror_misses = 0;
+                        view.lock().unwrap().mirror = leds.iter().map(|&l| c.get(l)).collect();
+                    }
+                    // Busy (e.g. right after an Apply): the driver just polls again; give up after ~1 s.
+                    Ok(None) if mirror_misses < 10 => mirror_misses += 1,
+                    Ok(None) => {
+                        mirror = false;
+                        view.lock().unwrap().mirror.clear();
+                        send(Msg::MirrorStopped(
+                            "Mirror stopped: keyboard kept declining reads".into(),
+                        ));
+                    }
                     Err(err) => {
                         mirror = false;
                         kb = None;
@@ -237,6 +252,7 @@ fn spawn_worker(
                     // A real I/O failure mid-frame: stop, and lock writes until replug.
                     if err.is::<WriteFailed>() {
                         locked_at = Some(usb.plugs.load(Relaxed));
+                        view.lock().unwrap().mirror.clear();
                     }
                     fx = None;
                     kb = None;
@@ -296,10 +312,13 @@ fn spawn_presence(ctx: egui::Context) -> Arc<Presence> {
                         .any(|d| d.vendor_id() == proto::VID && d.product_id() == proto::PID)
                 })
                 .unwrap_or(false);
-            if u.present.swap(now, Relaxed) != now {
+            if u.present.load(Relaxed) != now {
                 if now {
+                    // Bump the plug counter before publishing `present`, so the worker never
+                    // acts on a reconnect while still holding the old handle.
                     u.plugs.fetch_add(1, Relaxed);
                 }
+                u.present.store(now, Relaxed);
                 ctx.request_repaint();
             }
             thread::sleep(Duration::from_secs(2));
@@ -583,7 +602,8 @@ impl App {
                     if ui.button("Fill all").clicked() {
                         self.keys.fill(self.brush);
                     }
-                    let can_read = !self.busy && self.usb.present.load(Relaxed);
+                    // Not while live runs: it would copy the streamed frame.
+                    let can_read = !self.busy && self.usb.present.load(Relaxed) && !self.view.lock().unwrap().running;
                     if ui
                         .add_enabled(can_read, egui::Button::new("Load from keyboard"))
                         .on_hover_text("Copy what the keyboard shows right now")

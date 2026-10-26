@@ -373,11 +373,18 @@ impl Keyboard {
     /// reads 3 ms apart (each within 360 ms) carrying 64 bytes each, then `04 02` like the driver.
     /// Writes nothing. The driver first tries a 9-byte read that always fails on Windows before
     /// any USB traffic; it is skipped here since on other OSes it could consume the reply.
-    pub fn read_leds(&self) -> Result<LedColors> {
+    /// `Ok(None)`: the keyboard declined (busy); like the driver, nothing else is sent.
+    pub fn read_leds(&self) -> Result<Option<LedColors>> {
         self.send_wait(&Cmd::ReadLeds.packet(9), Duration::from_millis(5))?;
         let r = self.reply(Cmd::ReadLeds)?;
-        check_ack(Cmd::ReadLeds, &r)?;
-        ensure!(r[3] == 0x01, "LED read not accepted ({:02x?})", &r[..4]);
+        ensure!(
+            r[0] == 0x04 && r[1] == Cmd::ReadLeds as u8,
+            "LED read: unexpected reply {:02x?}",
+            &r[..4]
+        );
+        if r[3] != 0x01 {
+            return Ok(None);
+        }
         let mut d = [0u8; 576];
         for chunk in d.chunks_mut(64) {
             sleep(Duration::from_millis(3));
@@ -389,7 +396,7 @@ impl Keyboard {
             chunk.copy_from_slice(&buf[1..]);
         }
         self.command(Cmd::Apply, 0)?;
-        Ok(LedColors(d))
+        Ok(Some(LedColors(d)))
     }
 
     /// set, 5 ms, get; on a busy (FF) reply resend once, like FUN_0044f0a0. Returns the last reply.
