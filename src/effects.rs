@@ -43,7 +43,13 @@ impl Effect for Calibration {
     fn raw(&self) -> bool {
         true
     }
+    fn label(&self) -> String {
+        CALIBRATION_LABEL.into()
+    }
 }
+
+/// Live label while the calibration pattern streams; the UI keys off it.
+pub const CALIBRATION_LABEL: &str = "Calibration";
 
 /// Key centres normalised to 0..1 (x left→right, y top→bottom).
 pub fn key_pos() -> Vec<(f32, f32)> {
@@ -61,7 +67,8 @@ fn hsv(h: f32, s: f32, v: f32) -> Rgb {
 /// a colour out towards white (pure primaries look right). Raising each channel to `gamma` before
 /// sending keeps mixes saturated; 1.0 = unchanged. `uncurve` undoes it for colours read back.
 pub fn curve(c: Rgb, gamma: f32) -> Rgb {
-    if gamma <= 1.0 {
+    #[allow(clippy::neg_cmp_op_on_partial_ord)] // also bails out on NaN
+    if !(gamma > 1.0) {
         return c;
     }
     c.map(|x| ((x as f32 / 255.0).powf(gamma) * 255.0).round() as u8)
@@ -75,6 +82,15 @@ pub fn uncurve(c: Rgb, gamma: f32) -> Rgb {
 }
 
 pub const CURVE: std::ops::RangeInclusive<f32> = 1.0..=4.0;
+
+/// A curve from an untrusted source (settings file): finite and in range, else off.
+pub fn valid_curve(c: f32) -> f32 {
+    if c.is_finite() {
+        c.clamp(*CURVE.start(), *CURVE.end())
+    } else {
+        1.0
+    }
+}
 
 fn scale([r, g, b]: Rgb, k: f32) -> Rgb {
     let k = k.clamp(0.0, 1.0);

@@ -39,9 +39,9 @@ const DELAY: Duration = Duration::from_millis(35);
 
 pub const SCREEN: usize = 128;
 pub const FRAME_BYTES: usize = SCREEN * SCREEN * 2;
-pub const MAX_FRAMES: usize = 255;
+pub const MAX_FRAMES: usize = 255; // <screen gif_maxframes="255"/>
 /// Frame delays the screen accepts (driver UI: "30-500").
-pub const DELAY_MS: std::ops::RangeInclusive<u32> = 30..=500; // <screen gif_maxframes="255"/>
+pub const DELAY_MS: std::ops::RangeInclusive<u32> = 30..=500;
 const GIF_HEADER: usize = 256; // <screen gif_headlength="256"/>
 const PAGE: usize = 4096;
 

@@ -30,6 +30,8 @@ const TEXT: Color32 = Color32::from_gray(232);
 const MUTED: Color32 = Color32::from_gray(150);
 const OK: Color32 = Color32::from_rgb(0x5e, 0xd3, 0x86);
 const ERR: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
+/// Text backgrounds: black first, then dark tones that keep text readable.
+const BACKGROUNDS: [Rgb; 5] = [[0, 0, 0], [24, 24, 32], [10, 20, 70], [50, 10, 70], [255, 255, 255]];
 const SWATCHES: [[u8; 3]; 10] = [
     [0xff, 0x2d, 0x2d],
     [0xff, 0x7a, 0x00],
@@ -404,7 +406,6 @@ struct App {
     mirror_sent: bool,
     /// Colour curve shared with the worker (f32 bits).
     curve: Arc<AtomicU32>,
-    calibrating: bool,
     /// Status-bar icon (Linux with a tray host); with it, closing the window only hides it.
     tray: Option<tray::Tray>,
     tray_live: bool,
@@ -505,7 +506,6 @@ impl App {
             mirror_on: false,
             mirror_sent: false,
             curve: Default::default(),
-            calibrating: false,
             tray: None,
             tray_live: false,
             hidden: false,
@@ -573,12 +573,7 @@ impl App {
         self.vendor_speed = s
             .vendor_speed
             .clamp(*effects::VENDOR_SPEED.start(), *effects::VENDOR_SPEED.end());
-        let c = if s.curve.is_finite() {
-            s.curve.clamp(*effects::CURVE.start(), *effects::CURVE.end())
-        } else {
-            1.0
-        };
-        self.curve.store(c.to_bits(), Relaxed);
+        self.curve.store(effects::valid_curve(s.curve).to_bits(), Relaxed);
         self.audio_device = s.audio_device;
         if s.sensitivity.is_finite() {
             self.sensitivity = s.sensitivity.clamp(*SENSITIVITY.start(), *SENSITIVITY.end());
@@ -659,7 +654,13 @@ impl App {
             });
         ui.add_space(12.0);
 
-        let ready_to_test = !self.busy() && self.usb.present.load(Relaxed);
+        // Calibration state comes from what the worker actually streams, so stopping it any other
+        // way (Live tab, tray, unplug) can't leave stale row buttons behind.
+        let (running, calibrating) = {
+            let v = self.view.lock().unwrap();
+            (v.running, v.running && v.label == effects::CALIBRATION_LABEL)
+        };
+        let ready_to_test = !self.busy() && !running && self.usb.present.load(Relaxed);
         let (mut pick, mut start_cal): (Option<bool>, bool) = (None, false);
         let l = &mut self.light;
         ui.columns(2, |c| {
@@ -704,46 +705,47 @@ impl App {
                         ui.add_space(4.0);
                         toggle(ui, &mut l.rainbow, "Rainbow");
                     }
-                    ui.add_space(6.0);
-                    let mut g = f32::from_bits(self.curve.load(Relaxed));
-                    ui.horizontal(|ui| {
-                        ui.add_sized([86.0, 20.0], egui::Label::new("Colour curve"));
-                        ui.add(egui::Slider::new(&mut g, effects::CURVE).fixed_decimals(1))
-                            .on_hover_text("Raise if mixed colours look washed out on the keyboard. 1.0 = off. Applies to everything sent.");
-                    });
-                    self.curve.store(g.to_bits(), Relaxed);
-                    if self.calibrating {
-                        ui.add_space(4.0);
-                        label(ui, "Which keyboard row looks most like this?");
-                        ui.horizontal(|ui| {
-                            for c in effects::CAL_COLOURS {
-                                let (r, _) = ui.allocate_exact_size(Vec2::new(60.0, 24.0), Sense::hover());
-                                ui.painter().rect_filled(r, 6, rgb(c));
-                            }
-                            ui.label(RichText::new("left / right half").color(MUTED).size(12.0));
-                        });
-                        let rows = ["F row", "Numbers", "Q row", "A row", "Z row", "Space row"];
-                        ui.horizontal_wrapped(|ui| {
-                            for (name, g) in rows.into_iter().zip(effects::CALIBRATION) {
-                                if ui.button(format!("{name} ({g:.1})")).clicked() {
-                                    self.curve.store(g.to_bits(), Relaxed);
-                                    pick = Some(true);
-                                }
-                            }
-                            if ui.button("Cancel").clicked() {
-                                pick = Some(false);
-                            }
-                        });
-                    } else if ui
-                        .add_enabled(ready_to_test, egui::Button::new("Calibrate…"))
-                        .on_hover_text("Shows six curves on the keyboard rows; pick the row that looks right")
-                        .clicked()
-                    {
-                        pick = None;
-                        start_cal = true;
-                    }
                     ui.add_space(10.0);
                 }
+                ui.add_space(4.0);
+                let mut g = f32::from_bits(self.curve.load(Relaxed));
+                ui.horizontal(|ui| {
+                    ui.add_sized([86.0, 20.0], egui::Label::new("Colour curve"));
+                    ui.add(egui::Slider::new(&mut g, effects::CURVE).fixed_decimals(1))
+                        .on_hover_text("Raise if mixed colours look washed out on the keyboard. 1.0 = off. Applies to everything sent.");
+                });
+                self.curve.store(g.to_bits(), Relaxed);
+                if calibrating {
+                    ui.add_space(4.0);
+                    label(ui, "Which keyboard row looks most like this?");
+                    ui.horizontal(|ui| {
+                        for c in effects::CAL_COLOURS {
+                            let (r, _) = ui.allocate_exact_size(Vec2::new(60.0, 24.0), Sense::hover());
+                            ui.painter().rect_filled(r, 6, rgb(c));
+                        }
+                        ui.label(RichText::new("left / right half").color(MUTED).size(12.0));
+                    });
+                    let rows = ["F row", "Numbers", "Q row", "A row", "Z row", "Space row"];
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, g) in rows.into_iter().zip(effects::CALIBRATION) {
+                            if ui.button(format!("{name} ({g:.1})")).clicked() {
+                                self.curve.store(g.to_bits(), Relaxed);
+                                pick = Some(true);
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            pick = Some(false);
+                        }
+                    });
+                } else if ui
+                    .add_enabled(ready_to_test, egui::Button::new("Calibrate…"))
+                    .on_hover_text("Shows six curves on the keyboard rows; pick the row that looks right")
+                    .clicked()
+                {
+                    pick = None;
+                    start_cal = true;
+                }
+                ui.add_space(10.0);
                 if m.has_brightness() {
                     level(ui, "Brightness", &mut l.brightness);
                 }
@@ -776,11 +778,9 @@ impl App {
         });
         // Calibration streams a test pattern (live frames, nothing stored) until a row is picked.
         if start_cal {
-            self.calibrating = true;
             self.run(Job::Live(LiveCfg::Calibrate));
         }
         if let Some(applied) = pick {
-            self.calibrating = false;
             self.queue(Job::StopLive);
             self.status = Ok(if applied {
                 "Colour curve set"
@@ -839,7 +839,7 @@ impl App {
         {
             if resp.secondary_clicked() {
                 self.brush = self.keys[i];
-            } else if resp.is_pointer_button_down_on() {
+            } else if resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down()) {
                 self.keys[i] = self.brush;
             }
         }
@@ -1186,27 +1186,36 @@ impl App {
                     .desired_rows(3)
                     .desired_width(f32::INFINITY),
             );
-            ui.add_space(6.0);
-            label(ui, "Colour");
-            swatches(ui, &mut self.text_fg);
-            label(ui, "Background");
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut self.text_bg);
-                if ui.button("Black").clicked() {
-                    self.text_bg = [0; 3];
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.add_sized([86.0, 20.0], egui::Label::new("Size"));
-                ui.add(egui::Slider::new(&mut self.text_size, 12.0..=96.0).fixed_decimals(0));
-            });
-            toggle(ui, &mut self.text_scroll, "Scroll (marquee)");
+            ui.add_space(10.0);
+            let name = |t: &str| RichText::new(t).color(MUTED);
+            egui::Grid::new("text_options")
+                .num_columns(2)
+                .spacing([14.0, 10.0])
+                .show(ui, |ui| {
+                    ui.label(name("Colour"));
+                    swatches(ui, &mut self.text_fg);
+                    ui.end_row();
+                    ui.label(name("Background"));
+                    palette(ui, &mut self.text_bg, &BACKGROUNDS);
+                    ui.end_row();
+                    ui.label(name("Size"));
+                    ui.add(
+                        egui::Slider::new(&mut self.text_size, 12.0..=96.0)
+                            .fixed_decimals(0)
+                            .suffix(" px"),
+                    );
+                    ui.end_row();
+                    ui.label(name("Scroll"));
+                    toggle(ui, &mut self.text_scroll, "Marquee, right to left");
+                    ui.end_row();
+                });
+            ui.add_space(12.0);
+            if primary(ui, "Render", true) {
+                let f = screen::text_frames(&self.text, self.text_size, self.text_fg, self.text_bg, self.text_scroll);
+                self.set_frames(ui.ctx(), f);
+                self.status = Ok("Text rendered");
+            }
         });
-        if ui.button("Render").clicked() {
-            let f = screen::text_frames(&self.text, self.text_size, self.text_fg, self.text_bg, self.text_scroll);
-            self.set_frames(ui.ctx(), f);
-            self.status = Ok("Text rendered");
-        }
     }
 
     fn screen_pixels(&mut self, ui: &mut egui::Ui) {
@@ -1238,7 +1247,10 @@ impl App {
             let i = y.min(PIXEL_SIDE - 1) * PIXEL_SIDE + x.min(PIXEL_SIDE - 1);
             if resp.secondary_clicked() {
                 self.pixel_brush = self.pixels[i];
-            } else if resp.is_pointer_button_down_on() && self.pixels[i] != self.pixel_brush {
+            } else if resp.is_pointer_button_down_on()
+                && ui.input(|i| i.pointer.primary_down())
+                && self.pixels[i] != self.pixel_brush
+            {
                 self.pixels[i] = self.pixel_brush;
                 changed = true;
             }
@@ -1481,16 +1493,23 @@ fn tile(ui: &mut egui::Ui, text: &str, selected: bool, size: Vec2) -> egui::Resp
 }
 
 fn swatches(ui: &mut egui::Ui, value: &mut [u8; 3]) {
-    ui.horizontal_wrapped(|ui| {
+    palette(ui, value, &SWATCHES);
+}
+
+/// Colour dots plus a custom-colour picker.
+fn palette(ui: &mut egui::Ui, value: &mut [u8; 3], colours: &[Rgb]) {
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        for s in SWATCHES {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(26.0), Sense::click());
+        for &s in colours {
+            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::click());
             let sel = *value == s;
             if sel {
-                ui.painter().circle_stroke(rect.center(), 13.0, Stroke::new(2.0, TEXT));
+                ui.painter().circle_stroke(rect.center(), 11.0, Stroke::new(2.0, TEXT));
             }
+            let r = if sel { 7.5 } else { 9.5 };
+            ui.painter().circle_filled(rect.center(), r, rgb(s));
             ui.painter()
-                .circle_filled(rect.center(), if sel { 9.0 } else { 11.0 }, rgb(s));
+                .circle_stroke(rect.center(), r, Stroke::new(1.0, Color32::from_gray(70))); // dark dots stay visible
             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                 *value = s;
             }

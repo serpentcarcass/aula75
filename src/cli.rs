@@ -134,7 +134,11 @@ fn stream(make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>>) -> Result<()> {
             &leds
                 .iter()
                 .copied()
-                .zip(colors.into_iter().map(|c| effects::curve(c, gamma)))
+                .zip(
+                    colors
+                        .into_iter()
+                        .map(|c| if fx.raw() { c } else { effects::curve(c, gamma) }),
+                )
                 .collect::<Vec<_>>(),
         );
         match k.stream(&frame) {
@@ -165,10 +169,7 @@ fn saved_curve() -> f32 {
         .and_then(|d| std::fs::read_to_string(d.join("app.ron")).ok())
         .and_then(|s| ron::from_str::<std::collections::HashMap<String, String>>(&s).ok())
         .and_then(|kv| ron::from_str::<Saved>(kv.get(eframe::APP_KEY)?).ok());
-    saved
-        .map(|s| s.curve)
-        .filter(|c| c.is_finite())
-        .map_or(1.0, |c| c.clamp(*effects::CURVE.start(), *effects::CURVE.end()))
+    saved.map_or(1.0, |s| effects::valid_curve(s.curve))
 }
 
 fn parse_light(effect: &str, opts: &[String]) -> Result<Light> {
