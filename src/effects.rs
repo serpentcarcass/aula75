@@ -318,6 +318,11 @@ impl VendorFx {
         VendorFx::Rotate,
     ];
 
+    /// Case-insensitive lookup by `name()` (CLI and saved settings).
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.name().eq_ignore_ascii_case(s))
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             VendorFx::Star => "Star",
@@ -353,9 +358,8 @@ pub struct Vendor {
 
 impl Vendor {
     pub fn new(fx: VendorFx, speed: u8) -> Self {
-        let div = 15u32
-            .saturating_sub(speed.clamp(*VENDOR_SPEED.start(), *VENDOR_SPEED.end()) as u32)
-            .max(1);
+        // div 0 in the driver also means "every tick", hence max(1).
+        let div = (15 - speed.clamp(*VENDOR_SPEED.start(), *VENDOR_SPEED.end()) as u32).max(1);
         let groups = match fx {
             VendorFx::Rain | VendorFx::Roll | VendorFx::Breath => by_matrix(|_, c| c),
             VendorFx::Vertical => by_matrix(|r, _| r),
@@ -386,17 +390,6 @@ impl Vendor {
         }
     }
 
-    /// The driver's pseudo-random palette walk: srand(0xe8) before every rand() makes rand()
-    /// always 796, so it's just a counter.
-    fn next_palette(&mut self) -> usize {
-        self.counter += 1;
-        if self.counter > 100 {
-            self.counter -= 100;
-        }
-        let i = (796 + self.counter as usize) & 0x7f;
-        if i < 0x6b { i } else { i - 0x6a }
-    }
-
     fn step(&mut self) {
         let sin = |i: usize| vt::SIN[i % 192];
         let wave = |p: usize| [sin(p), sin(p + 64), sin(p + 128)];
@@ -406,7 +399,7 @@ impl Vendor {
                     self.alpha[k] = self.phase[k] as u8;
                     if self.phase[k] == 0 {
                         self.phase[k] = 255;
-                        let i = self.next_palette() * 3;
+                        let i = next_palette(&mut self.counter) * 3;
                         self.rgb[k] = [vt::STAR_PALETTE[i], vt::STAR_PALETTE[i + 1], vt::STAR_PALETTE[i + 2]];
                     } else {
                         self.phase[k] -= 1;
@@ -419,9 +412,9 @@ impl Vendor {
                     if self.mask[col] & 0x80 != 0 {
                         self.mask[col] = 1;
                     }
-                    for &k in &self.groups[col].clone() {
+                    for &k in &self.groups[col] {
                         if self.mask[col] & (1 << vt::KEY_MATRIX[k].1) != 0 {
-                            let i = self.next_palette() * 3;
+                            let i = next_palette(&mut self.counter) * 3;
                             self.rgb[k] = [vt::RAIN_PALETTE[i], vt::RAIN_PALETTE[i + 1], vt::RAIN_PALETTE[i + 2]];
                         }
                     }
@@ -484,13 +477,29 @@ impl Effect for Vendor {
         for _ in 0..due {
             self.step();
         }
-        self.last += self.period * due;
+        // After a long stall drop the backlog instead of fast-forwarding through it.
+        self.last = if due == 20 {
+            Instant::now()
+        } else {
+            self.last + self.period * due
+        };
         self.rgb
             .iter()
             .zip(&self.alpha)
             .map(|(c, &a)| c.map(|x| ((x as u32 * a as u32) >> 8) as u8))
             .collect()
     }
+}
+
+/// The driver's pseudo-random palette walk: srand(0xe8) before every rand() makes rand()
+/// always 796, so it's just a counter over the 107-colour palette.
+fn next_palette(counter: &mut i32) -> usize {
+    *counter += 1;
+    if *counter > 100 {
+        *counter -= 100;
+    }
+    let i = (796 + *counter as usize) & 0x7f;
+    if i < 0x6b { i } else { i - 0x6a }
 }
 
 /// Key indices grouped by matrix row or column (vendor `row_col`).
@@ -585,8 +594,9 @@ mod tests {
         let ringed: usize = by_hid(&vt::SPRING_RINGS, 12).iter().map(Vec::len).sum();
         assert!(ringed >= 70, "spring covers {ringed} keys");
         // The palette walk stays inside the 107-colour palette.
-        let mut v = Vendor::new(VendorFx::Star, 8);
-        assert!((0..500).all(|_| v.next_palette() < 107));
+        let mut c = 0;
+        assert!((0..500).all(|_| next_palette(&mut c) < 107));
+        assert_eq!(VendorFx::from_name("spring"), Some(VendorFx::Spring));
     }
 
     #[test]

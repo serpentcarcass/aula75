@@ -96,9 +96,7 @@ fn dispatch(args: &[String]) -> Result<()> {
                     Box::new(move || Ok(Box::new(effects::Pomodoro::new(focus, rest)) as _))
                 }
                 other => {
-                    let fx = effects::VendorFx::ALL
-                        .into_iter()
-                        .find(|f| f.name().eq_ignore_ascii_case(other))
+                    let fx = effects::VendorFx::from_name(other)
                         .with_context(|| format!("live: unknown effect `{other}`"))?;
                     known(&opts, &["speed"])?;
                     let speed = opt(&opts, "speed", d.vendor_speed, |v| parse_in(v, effects::VENDOR_SPEED))?;

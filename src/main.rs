@@ -349,7 +349,9 @@ struct App {
     jobs: mpsc::Sender<Job>,
     msgs: mpsc::Receiver<Msg>,
     usb: Arc<Presence>,
-    busy: bool,
+    /// One-shot jobs queued to the worker and not yet answered (a counter, since tray jobs can
+    /// be queued while a window job is still running).
+    in_flight: u32,
     progress: Option<u32>,
     status: Result<&'static str, String>,
     tab: Tab,
@@ -390,7 +392,8 @@ struct App {
     /// Mirroring paused after a failed read; cleared by the toggle or a replug. Not saved, so one
     /// failure doesn't switch the user's choice off for good.
     mirror_failed: bool,
-    last_present: bool,
+    seen_plugs: u32,
+    was_focused: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -439,7 +442,7 @@ impl App {
             jobs,
             msgs,
             usb,
-            busy: false,
+            in_flight: 0,
             progress: None,
             status: Ok("Ready"),
             tab: Tab::Lighting,
@@ -482,7 +485,8 @@ impl App {
             tray_live: false,
             hidden: false,
             mirror_failed: false,
-            last_present: false,
+            seen_plugs: 0,
+            was_focused: false,
             quitting: false,
         };
         app.restore(Saved::default()); // single source of defaults
@@ -537,7 +541,7 @@ impl App {
         } else {
             LiveKind::Music
         };
-        if let Some(fx) = effects::VendorFx::ALL.into_iter().find(|f| f.name() == s.vendor_fx) {
+        if let Some(fx) = effects::VendorFx::from_name(&s.vendor_fx) {
             self.vendor_fx = fx;
         }
         self.vendor_speed = s
@@ -569,9 +573,19 @@ impl App {
         }
     }
 
+    fn busy(&self) -> bool {
+        self.in_flight > 0
+    }
+
+    /// Queues a one-shot job; its `Msg::Done` decrements the in-flight count.
+    fn queue(&mut self, job: Job) -> bool {
+        let sent = self.jobs.send(job).is_ok();
+        self.in_flight += sent as u32;
+        sent
+    }
+
     fn run(&mut self, job: Job) {
-        if !self.busy && self.jobs.send(job).is_ok() {
-            self.busy = true;
+        if !self.busy() && self.queue(job) {
             self.progress = None;
             self.status = Ok("Working…");
         }
@@ -693,7 +707,7 @@ impl App {
                         self.keys.fill(self.brush);
                     }
                     // Not while live runs: it would copy the streamed frame.
-                    let can_read = !self.busy && self.usb.present.load(Relaxed) && !self.view.lock().unwrap().running;
+                    let can_read = !self.busy() && self.usb.present.load(Relaxed) && !self.view.lock().unwrap().running;
                     if ui
                         .add_enabled(can_read, egui::Button::new("Load from keyboard"))
                         .on_hover_text("Copy what the keyboard shows right now")
@@ -959,13 +973,13 @@ impl App {
             );
             ui.add_space(16.0);
             let (txt, col) = match &self.status {
-                Ok(s) => (s.to_string(), if self.busy { ACCENT } else { MUTED }),
+                Ok(s) => (s.to_string(), if self.busy() { ACCENT } else { MUTED }),
                 Err(e) => (e.clone(), ERR),
             };
             ui.add(egui::Label::new(RichText::new(txt).color(col).size(13.0)).truncate());
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let ready = present && !self.busy;
+                let ready = present && !self.busy();
                 match self.tab {
                     Tab::Lighting => {
                         if primary(ui, "Apply lighting", ready) {
@@ -989,7 +1003,7 @@ impl App {
                                 Err(e) => self.status = Err(format!("{e:#}")),
                             }
                         }
-                        if let Some(p) = self.progress.filter(|_| self.busy) {
+                        if let Some(p) = self.progress.filter(|_| self.busy()) {
                             ui.add(
                                 egui::ProgressBar::new(p as f32 / 100.0)
                                     .desired_width(160.0)
@@ -1004,7 +1018,7 @@ impl App {
                     }
                     Tab::Live => {
                         if self.view.lock().unwrap().running {
-                            if primary(ui, "Stop", !self.busy) {
+                            if primary(ui, "Stop", !self.busy()) {
                                 self.run(Job::StopLive);
                             }
                         } else if primary(ui, "Start live", ready) {
@@ -1584,20 +1598,24 @@ impl eframe::App for App {
                 }
                 Msg::Keys(k) => self.keys = k,
                 Msg::Done(r) => {
-                    self.busy = false;
+                    self.in_flight = self.in_flight.saturating_sub(1);
                     self.status = r;
                 }
             }
         }
         let present = self.usb.present.load(Relaxed);
-        if present && !self.last_present {
+        let plugs = self.usb.plugs.load(Relaxed);
+        if plugs != self.seen_plugs {
+            self.seen_plugs = plugs;
             self.mirror_failed = false; // (re)plugged: worth trying again
         }
-        self.last_present = present;
-        // A hidden/minimised window gets focus back when the user brings it up again.
-        if ctx.input(|i| i.focused) {
+        // A hidden/minimised window regains focus when the user brings it back (edge, not level,
+        // so a stale "focused" right after closing doesn't un-hide it).
+        let focused = ctx.input(|i| i.focused);
+        if focused && !self.was_focused {
             self.hidden = false;
         }
+        self.was_focused = focused;
         let want = !self.hidden && !self.mirror_failed && self.tab == Tab::Lighting && self.mirror_on && present;
         if want != self.mirror_sent && self.jobs.send(Job::Mirror(want)).is_ok() {
             self.mirror_sent = want;
@@ -1619,9 +1637,9 @@ impl eframe::App for App {
                 }
                 // Queued straight to the worker (which serialises everything) so a click from the
                 // tray isn't dropped while the window is busy with something else.
-                tray::TrayCmd::Music => drop(self.jobs.send(Job::Live(self.live_cfg(LiveKind::Music)))),
-                tray::TrayCmd::Pomodoro => drop(self.jobs.send(Job::Live(self.live_cfg(LiveKind::Pomodoro)))),
-                tray::TrayCmd::StopLive => drop(self.jobs.send(Job::StopLive)),
+                tray::TrayCmd::Music => drop(self.queue(Job::Live(self.live_cfg(LiveKind::Music)))),
+                tray::TrayCmd::Pomodoro => drop(self.queue(Job::Live(self.live_cfg(LiveKind::Pomodoro)))),
+                tray::TrayCmd::StopLive => drop(self.queue(Job::StopLive)),
                 tray::TrayCmd::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1647,6 +1665,9 @@ impl eframe::App for App {
                 egui::ViewportCommand::Visible(false)
             });
             self.hidden = true;
+            if self.mirror_sent && self.jobs.send(Job::Mirror(false)).is_ok() {
+                self.mirror_sent = false; // a minimised window may get no further updates
+            }
         }
     }
 
