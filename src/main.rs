@@ -96,10 +96,13 @@ const MIRROR_EVERY: Duration = Duration::from_millis(100);
 /// If any write fails after the device was opened, the firmware may hold a half-written
 /// transaction, and the next `04 02` (from any job or live frame) could commit it. So every
 /// write is refused until the keyboard has been physically replugged.
+/// `curve`: the colour curve (f32 bits) applied to everything sent to the keyboard and undone for
+/// colours read back, so the UI always works with colours as picked.
 fn spawn_worker(
     ctx: egui::Context,
     view: Arc<Mutex<LiveView>>,
     usb: Arc<Presence>,
+    curve: Arc<AtomicU32>,
 ) -> (mpsc::Sender<Job>, mpsc::Receiver<Msg>) {
     let (jtx, jrx) = mpsc::channel::<Job>();
     let (mtx, mrx) = mpsc::channel();
@@ -148,6 +151,9 @@ fn spawn_worker(
                 }
                 continue;
             }
+            let gamma = f32::from_bits(curve.load(Relaxed));
+            let out = |c: Rgb| effects::curve(c, gamma);
+            let back = |c: Rgb| effects::uncurve(c, gamma);
             if let Some(job) = job {
                 let res = match job {
                     Job::Live(cfg) => {
@@ -169,8 +175,12 @@ fn spawn_worker(
                         fx = None;
                         Ok("Live effect stopped")
                     }
-                    Job::Light(l) => write(&mut kb, |k| k.set_light(&l)).map(|_| "Lighting applied"),
+                    Job::Light(l) => {
+                        let l = Light { rgb: out(l.rgb), ..l };
+                        write(&mut kb, |k| k.set_light(&l)).map(|_| "Lighting applied")
+                    }
                     Job::PerKey(keys, br) => {
+                        let keys: Vec<_> = keys.into_iter().map(|(l, c)| (l, out(c))).collect();
                         write(&mut kb, |k| k.set_per_key(&keys, br)).map(|_| "Per-key colours applied")
                     }
                     Job::Clock => write(&mut kb, |k| k.sync_clock()).map(|_| "Clock synced"),
@@ -183,7 +193,7 @@ fn spawn_worker(
                     .map(|_| "Screen uploaded"),
                     Job::ReadKeys => device(&mut kb).and_then(|k| k.read_leds()).and_then(|c| {
                         let c = c.context("keyboard is busy, try again")?;
-                        send(Msg::Keys(leds.iter().map(|&l| c.get(l)).collect()));
+                        send(Msg::Keys(leds.iter().map(|&l| back(c.get(l))).collect()));
                         Ok("Loaded colours from the keyboard")
                     }),
                     Job::Mirror(_) => unreachable!("handled above"),
@@ -205,7 +215,7 @@ fn spawn_worker(
                 match device(&mut kb).and_then(|k| k.read_leds()) {
                     Ok(Some(c)) => {
                         mirror_misses = 0;
-                        view.lock().unwrap().mirror = leds.iter().map(|&l| c.get(l)).collect();
+                        view.lock().unwrap().mirror = leds.iter().map(|&l| back(c.get(l))).collect();
                     }
                     // Busy (e.g. right after an Apply): the driver just polls again; give up after ~1 s.
                     Ok(None) if mirror_misses < 10 => mirror_misses += 1,
@@ -229,7 +239,13 @@ fn spawn_worker(
             let Some(e) = fx.as_mut() else { continue };
             next = Instant::now() + FRAME;
             let colors = e.frame();
-            let frame = RtFrame::new(&leds.iter().copied().zip(colors.iter().copied()).collect::<Vec<_>>());
+            let frame = RtFrame::new(
+                &leds
+                    .iter()
+                    .copied()
+                    .zip(colors.iter().map(|&c| out(c)))
+                    .collect::<Vec<_>>(),
+            );
             let res = write(&mut kb, |k| k.stream(&frame));
             {
                 let mut v = view.lock().unwrap();
@@ -384,6 +400,8 @@ struct App {
     /// Lighting preview shows what the keyboard reports instead of a simulation.
     mirror_on: bool,
     mirror_sent: bool,
+    /// Colour curve shared with the worker (f32 bits).
+    curve: Arc<AtomicU32>,
     /// Status-bar icon (Linux with a tray host); with it, closing the window only hides it.
     tray: Option<tray::Tray>,
     tray_live: bool,
@@ -417,8 +435,10 @@ impl App {
         style(&cc.egui_ctx);
         let view = Arc::new(Mutex::new(LiveView::default()));
         let usb = spawn_presence(cc.egui_ctx.clone());
-        let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone());
+        let curve = Arc::new(AtomicU32::new(Saved::default().curve.to_bits()));
+        let (jobs, msgs) = spawn_worker(cc.egui_ctx.clone(), view.clone(), usb.clone(), curve.clone());
         let mut app = Self::with(jobs, msgs, usb, view);
+        app.curve = curve;
         let ctx = cc.egui_ctx.clone();
         app.tray = tray::spawn(Box::new(move || ctx.request_repaint()));
         app.audio_devices = effects::input_devices();
@@ -481,6 +501,7 @@ impl App {
             rest_min: 0,
             mirror_on: false,
             mirror_sent: false,
+            curve: Default::default(),
             tray: None,
             tray_live: false,
             hidden: false,
@@ -508,6 +529,7 @@ impl App {
             vendor: self.live_kind == LiveKind::Vendor,
             vendor_fx: self.vendor_fx.name().into(),
             vendor_speed: self.vendor_speed,
+            curve: f32::from_bits(self.curve.load(Relaxed)),
             audio_device: self.audio_device.clone(),
             sensitivity: self.sensitivity,
             work_min: self.work_min,
@@ -547,6 +569,12 @@ impl App {
         self.vendor_speed = s
             .vendor_speed
             .clamp(*effects::VENDOR_SPEED.start(), *effects::VENDOR_SPEED.end());
+        let c = if s.curve.is_finite() {
+            s.curve.clamp(*effects::CURVE.start(), *effects::CURVE.end())
+        } else {
+            1.0
+        };
+        self.curve.store(c.to_bits(), Relaxed);
         self.audio_device = s.audio_device;
         if s.sensitivity.is_finite() {
             self.sensitivity = s.sensitivity.clamp(*SENSITIVITY.start(), *SENSITIVITY.end());
@@ -670,6 +698,14 @@ impl App {
                         ui.add_space(4.0);
                         toggle(ui, &mut l.rainbow, "Rainbow");
                     }
+                    ui.add_space(6.0);
+                    let mut g = f32::from_bits(self.curve.load(Relaxed));
+                    ui.horizontal(|ui| {
+                        ui.add_sized([86.0, 20.0], egui::Label::new("Colour curve"));
+                        ui.add(egui::Slider::new(&mut g, effects::CURVE).fixed_decimals(1))
+                            .on_hover_text("Raise if mixed colours look washed out on the keyboard. 1.0 = off. Applies to everything sent.");
+                    });
+                    self.curve.store(g.to_bits(), Relaxed);
                     ui.add_space(10.0);
                 }
                 if m.has_brightness() {
@@ -1562,6 +1598,7 @@ struct Saved {
     vendor: bool,
     vendor_fx: String,
     vendor_speed: u8,
+    curve: f32,
     audio_device: Option<String>,
     sensitivity: f32,
     work_min: u32,
@@ -1585,6 +1622,7 @@ impl Default for Saved {
             vendor: false,
             vendor_fx: "Spring".into(),
             vendor_speed: 10,
+            curve: 1.0,
             audio_device: None,
             sensitivity: 1.2,
             work_min: 25,

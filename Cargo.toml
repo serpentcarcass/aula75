@@ -17,6 +17,7 @@ epaint_default_fonts = "0.37.0"
 hidapi = "2.6.7"
 image = { version = "0.25.10", default-features = false, features = ["gif", "png", "jpeg"] }
 libc = "0.2.191"
+ron = "0.12"
 serde = { version = "1.0.229", features = ["derive"] }
 
 # PipeWire host lets us record what's playing (sink capture) on Linux; needs libpipewire-0.3-dev + clang.
@@ -25,5 +26,3 @@ cpal = { version = "0.18.2", features = ["pipewire"] }
 # Status-bar icon over D-Bus (StatusNotifierItem), no GTK.
 ksni = { version = "0.3.7", features = ["blocking"] }
 
-[dev-dependencies]
-ron = "0.12"

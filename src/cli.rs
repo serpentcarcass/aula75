@@ -49,7 +49,8 @@ fn dispatch(args: &[String]) -> Result<()> {
         }
         "light" => {
             let (effect, opts) = rest.split_first().context("light: which effect? (see `modes`)")?;
-            let light = parse_light(effect, opts)?;
+            let mut light = parse_light(effect, opts)?;
+            light.rgb = effects::curve(light.rgb, saved_curve());
             write(|k| k.set_light(&light))?;
             println!("lighting applied");
             Ok(())
@@ -122,13 +123,20 @@ fn write(op: impl FnOnce(&Keyboard) -> Result<()>) -> Result<()> {
 fn stream(make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>>) -> Result<()> {
     let k = Keyboard::open()?;
     let mut fx = make()?;
+    let gamma = saved_curve();
     let leds: Vec<LedIndex> = (0..KEYS.len()).filter_map(LedIndex::of_key).collect();
     let mut busy = 0;
     let _ = writeln!(std::io::stderr(), "streaming, Ctrl-C to stop");
     while !STOP.load(SeqCst) {
         let next = Instant::now() + Duration::from_millis(33);
         let colors = fx.frame();
-        let frame = RtFrame::new(&leds.iter().copied().zip(colors).collect::<Vec<_>>());
+        let frame = RtFrame::new(
+            &leds
+                .iter()
+                .copied()
+                .zip(colors.into_iter().map(|c| effects::curve(c, gamma)))
+                .collect::<Vec<_>>(),
+        );
         match k.stream(&frame) {
             Ok(Sent::Shown) => busy = 0,
             Ok(Sent::Busy) => {
@@ -148,6 +156,19 @@ fn stream(make: Box<dyn FnOnce() -> Result<Box<dyn Effect>>>) -> Result<()> {
     }
     let _ = writeln!(std::io::stderr(), "\nstopped");
     Ok(())
+}
+
+/// The window's "Colour curve", read from its saved settings so the CLI looks the same; 1.0 if
+/// there are none. The file is user-editable: anything odd falls back to 1.0.
+fn saved_curve() -> f32 {
+    let saved = eframe::storage_dir("aula-control")
+        .and_then(|d| std::fs::read_to_string(d.join("app.ron")).ok())
+        .and_then(|s| ron::from_str::<std::collections::HashMap<String, String>>(&s).ok())
+        .and_then(|kv| ron::from_str::<Saved>(kv.get(eframe::APP_KEY)?).ok());
+    saved
+        .map(|s| s.curve)
+        .filter(|c| c.is_finite())
+        .map_or(1.0, |c| c.clamp(*effects::CURVE.start(), *effects::CURVE.end()))
 }
 
 fn parse_light(effect: &str, opts: &[String]) -> Result<Light> {

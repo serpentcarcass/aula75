@@ -32,6 +32,25 @@ fn hsv(h: f32, s: f32, v: f32) -> Rgb {
     eframe::egui::ecolor::rgb_from_hsv((h, s, v)).map(|c| (c * 255.0) as u8)
 }
 
+/// Colour curve: these LEDs are very non-linear, so even small amounts of a second channel wash
+/// a colour out towards white (pure primaries look right). Raising each channel to `gamma` before
+/// sending keeps mixes saturated; 1.0 = unchanged. `uncurve` undoes it for colours read back.
+pub fn curve(c: Rgb, gamma: f32) -> Rgb {
+    if gamma <= 1.0 {
+        return c;
+    }
+    c.map(|x| ((x as f32 / 255.0).powf(gamma) * 255.0).round() as u8)
+}
+
+pub fn uncurve(c: Rgb, gamma: f32) -> Rgb {
+    if gamma <= 1.0 {
+        return c;
+    }
+    c.map(|x| ((x as f32 / 255.0).powf(1.0 / gamma) * 255.0).round() as u8)
+}
+
+pub const CURVE: std::ops::RangeInclusive<f32> = 1.0..=4.0;
+
 fn scale([r, g, b]: Rgb, k: f32) -> Rgb {
     let k = k.clamp(0.0, 1.0);
     [(r as f32 * k) as u8, (g as f32 * k) as u8, (b as f32 * k) as u8]
@@ -597,6 +616,19 @@ mod tests {
         let mut c = 0;
         assert!((0..500).all(|_| next_palette(&mut c) < 107));
         assert_eq!(VendorFx::from_name("spring"), Some(VendorFx::Spring));
+    }
+
+    #[test]
+    fn colour_curve() {
+        assert_eq!(curve([255, 45, 45], 1.0), [255, 45, 45], "1.0 is off");
+        assert_eq!(curve([255, 45, 45], 3.0)[1], 1, "a small mix almost vanishes");
+        assert_eq!(curve([255, 0, 0], 3.0), [255, 0, 0], "primaries stay pure");
+        for x in [64u8, 128, 200, 255] {
+            assert!(
+                uncurve(curve([x; 3], 2.5), 2.5)[0].abs_diff(x) <= 4,
+                "round trip for {x}"
+            );
+        }
     }
 
     #[test]
